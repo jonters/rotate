@@ -30,8 +30,8 @@ tasks=(
     # "overcooked-v1/counter_circuit"
     # "overcooked-v1/cramped_room"
     # "overcooked-v1/forced_coord"
-    # "lbf"
-    "simple_sabotage"
+    "lbf"
+    # "simple_sabotage"
 )
 
 # Function to log messages
@@ -49,7 +49,7 @@ failure_count=0
 for task in "${tasks[@]}"; do
     log "Starting task: ${algo}/${task}"
     
-    if python open_ended_training/run.py algorithm="${algo}/${task}" task="${task}" label="${label}" \
+    if python -m open_ended_training.run algorithm="${algo}/${task}" task="${task}" label="${label}" \
         algorithm.CONF_OBJ_TYPE="${conf_obj_type}" \
         algorithm.NUM_SEEDS="${num_seeds}" \
         2>> "${log_file}"; then

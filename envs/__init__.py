@@ -1,4 +1,5 @@
 import copy
+import numpy as np
 
 import jaxmarl
 import jumanji
@@ -65,6 +66,20 @@ def make_env(env_name: str, env_kwargs: dict = {}):
         layout = augmented_layouts[env_kwargs['layout']]
         env_kwargs_copy["layout"] = layout
         env = OvercookedWrapper(**env_kwargs_copy)
+    elif env_name == 'hanabi':
+        default_env_kwargs = {
+            "num_agents": 2,
+            "num_colors": 5,
+            "num_ranks": 5,
+            "max_info_tokens": 8,
+            "max_life_tokens": 3,
+            "num_cards_of_rank": np.array([3, 2, 2, 2, 1]),
+        }
+
+        from envs.hanabi.hanabi_wrapper import HanabiWrapper
+
+        env_kwargs = default_env_kwargs
+        env = HanabiWrapper(**env_kwargs)
     elif env_name == "simple_sabotage":
         default_env_kwargs = {"max_steps": 5, "max_history_len": 5}
         env_kwargs_copy = dict(copy.deepcopy(env_kwargs))

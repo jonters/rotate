@@ -8,8 +8,8 @@ from common.wandb_visualizations import Logger
 from open_ended_training.rotate_without_pop import run_rotate_without_pop
 from open_ended_training.rotate_with_mixed_play import run_rotate_with_mixed_play
 from open_ended_training.rotate import run_rotate
-from open_ended_minimax import run_minimax
-from paired import run_paired
+from open_ended_training.open_ended_minimax import run_minimax
+from open_ended_training.paired import run_paired
 
 @hydra.main(version_base=None, config_path="configs", config_name="base_config_oel")
 def run_training(cfg):
