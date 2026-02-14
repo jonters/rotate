@@ -30,7 +30,8 @@ tasks=(
     # "overcooked-v1/counter_circuit"
     # "overcooked-v1/cramped_room"
     # "overcooked-v1/forced_coord"
-    "lbf"
+    # "lbf"
+    "hanabi"
     # "simple_sabotage"
 )
 

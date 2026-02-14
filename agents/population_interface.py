@@ -57,10 +57,19 @@ class AgentPopulation:
                                               aux_obs=aux_obs, 
                                               env_state=env_state, 
                                               test_mode=test_mode))
+
+        # HACK FLAG: reshaping obs to be what an S5 agent expects. No idea if this will work with other policies.
+        obs_reshaped = jax.tree.map(lambda x: x.reshape(num_envs, 1, 1, -1), obs)
+        done_reshape = jax.tree.map(lambda x: x.reshape(num_envs, 1, 1), done)
+        hstate_reshape = jax.tree.map(lambda x: x.reshape(num_envs, 1, 1, -1), hstate)
+
         actions, new_hstate = vmapped_get_action(
-            gathered_params, obs, done, avail_actions, hstate, 
+            gathered_params, obs_reshaped, done_reshape, avail_actions, hstate_reshape, 
             rngs_batched)
-        return actions, new_hstate
+
+        hstate_shape_back = jax.tree.map(lambda x: x.reshape(1, num_envs, -1), new_hstate)
+        return actions, hstate_shape_back
+
     
     def init_hstate(self, n: int, aux_info: dict=None):
         '''Initialize the hidden state for n members of the population.'''

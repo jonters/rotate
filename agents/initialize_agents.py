@@ -2,7 +2,9 @@ import jax
 from agents.agent_interface import S5ActorCriticPolicy, \
     MLPActorCriticPolicy, RNNActorCriticPolicy, ActorWithDoubleCriticPolicy, \
     ActorWithConditionalCriticPolicy, PseudoActorWithDoubleCriticPolicy, \
-    PseudoActorWithConditionalCriticPolicy
+    PseudoActorWithConditionalCriticPolicy, \
+    PseudoActorWithConditionalCriticPolicy, S5ActorWithConditionalCriticPolicy, \
+    PseudoS5ActorWithConditionalCriticPolicy
 
 
 def initialize_s5_agent(config, env, rng):
@@ -122,6 +124,50 @@ def initialize_pseudo_actor_with_conditional_critic(config, env, rng):
         obs_dim=env.observation_space(env.agents[0]).shape[0],
         pop_size=config["POP_SIZE"],
         activation=config.get("ACTIVATION", "tanh"),
+    )
+    rng, init_rng = jax.random.split(rng)
+    init_params = policy.init_params(init_rng)
+
+    return policy, init_params
+
+def initialize_s5_actor_with_conditional_critic(config, env, rng):
+    """Initialize an S5 actor with conditional critic with the given config."""
+    policy = S5ActorWithConditionalCriticPolicy(
+        action_dim=env.action_space(env.agents[0]).n,
+        obs_dim=env.observation_space(env.agents[0]).shape[0],
+        pop_size=config["POP_SIZE"],
+        d_model=config.get("S5_D_MODEL", 128),
+        ssm_size=config.get("S5_SSM_SIZE", 128),
+        ssm_n_layers=config.get("S5_N_LAYERS", 2),
+        blocks=config.get("S5_BLOCKS", 1),
+        fc_hidden_dim=config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024),
+        fc_n_layers=config.get("FC_N_LAYERS", 3),
+        s5_activation=config.get("S5_ACTIVATION", "full_glu"),
+        s5_do_norm=config.get("S5_DO_NORM", True),
+        s5_prenorm=config.get("S5_PRENORM", True),
+        s5_do_gtrxl_norm=config.get("S5_DO_GTRXL_NORM", True)
+    )
+    rng, init_rng = jax.random.split(rng)
+    init_params = policy.init_params(init_rng)
+
+    return policy, init_params
+
+def initialize_pseudo_s5_actor_with_conditional_critic(config, env, rng):
+    """Initialize a pseudo S5 actor with conditional critic with the given config."""
+    policy = PseudoS5ActorWithConditionalCriticPolicy(
+        action_dim=env.action_space(env.agents[0]).n,
+        obs_dim=env.observation_space(env.agents[0]).shape[0],
+        pop_size=config["POP_SIZE"],
+        d_model=config.get("S5_D_MODEL", 128),
+        ssm_size=config.get("S5_SSM_SIZE", 128),
+        ssm_n_layers=config.get("S5_N_LAYERS", 2),
+        blocks=config.get("S5_BLOCKS", 1),
+        fc_hidden_dim=config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024),
+        fc_n_layers=config.get("FC_N_LAYERS", 3),
+        s5_activation=config.get("S5_ACTIVATION", "full_glu"),
+        s5_do_norm=config.get("S5_DO_NORM", True),
+        s5_prenorm=config.get("S5_PRENORM", True),
+        s5_do_gtrxl_norm=config.get("S5_DO_GTRXL_NORM", True)
     )
     rng, init_rng = jax.random.split(rng)
     init_params = policy.init_params(init_rng)

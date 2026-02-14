@@ -15,7 +15,7 @@ import time
 import jax
 import jax.numpy as jnp
 
-from agents.agent_interface import ActorWithDoubleCriticPolicy, MLPActorCriticPolicy, S5ActorCriticPolicy
+from agents.agent_interface import ActorWithDoubleCriticPolicy, MLPActorCriticPolicy, S5ActorCriticPolicy, S5ActorWithDoubleCriticPolicy
 from agents.population_buffer import BufferedPopulation, add_partners_to_buffer, get_final_buffer
 from agents.initialize_agents import initialize_s5_agent, initialize_actor_with_double_critic
 from common.plot_utils import get_metric_names
