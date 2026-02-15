@@ -1017,7 +1017,7 @@ def open_ended_training_step(carry, ego_policy, conf_policy, br_policy, partner_
 def train_rotate_mp(rng, env, algorithm_config, ego_config): # Added ego_config
     rng, init_ego_rng, init_conf_rng, init_br_rng, train_rng = jax.random.split(rng, 5)
     
-    ego_policy, init_ego_params = initialize_s5_agent(algorithm_config, env, init_ego_rng)
+    ego_policy, init_ego_params = initialize_s5_agent(ego_config, env, init_ego_rng)
 
     # initialize PARTNER_POP_SIZE conf and br params
     conf_policy = ActorWithDoubleCriticPolicy(
@@ -1034,16 +1034,16 @@ def train_rotate_mp(rng, env, algorithm_config, ego_config): # Added ego_config
         br_policy = S5ActorCriticPolicy(
             action_dim=env.action_space(env.agents[0]).n,
             obs_dim=env.observation_space(env.agents[0]).shape[0],
-            d_model=algorithm_config.get("S5_D_MODEL", 128),
-            ssm_size=algorithm_config.get("S5_SSM_SIZE", 128),
-            n_layers=algorithm_config.get("S5_N_LAYERS", 2),
-            blocks=algorithm_config.get("S5_BLOCKS", 1),
-            fc_hidden_dim=algorithm_config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024),
-            fc_n_layers=algorithm_config.get("FC_N_LAYERS", 3),
-            s5_activation=algorithm_config.get("S5_ACTIVATION", "full_glu"),
-            s5_do_norm=algorithm_config.get("S5_DO_NORM", True),
-            s5_prenorm=algorithm_config.get("S5_PRENORM", True),
-            s5_do_gtrxl_norm=algorithm_config.get("S5_DO_GTRXL_NORM", True),
+            d_model=ego_config.get("S5_D_MODEL", 128),
+            ssm_size=ego_config.get("S5_SSM_SIZE", 128),
+            n_layers=ego_config.get("S5_N_LAYERS", 2),
+            blocks=ego_config.get("S5_BLOCKS", 1),
+            fc_hidden_dim=ego_config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024),
+            fc_n_layers=ego_config.get("FC_N_LAYERS", 3),
+            s5_activation=ego_config.get("S5_ACTIVATION", "full_glu"),
+            s5_do_norm=ego_config.get("S5_DO_NORM", True),
+            s5_prenorm=ego_config.get("S5_PRENORM", True),
+            s5_do_gtrxl_norm=ego_config.get("S5_DO_GTRXL_NORM", True),
         )
     else:
         br_policy = MLPActorCriticPolicy(
@@ -1120,7 +1120,7 @@ def run_rotate_with_mixed_play(config, wandb_logger):
     # Prepare return values for heldout evaluation
     _ , ego_outs = outs
     ego_params = jax.tree.map(lambda x: x[:, :, 0], ego_outs["final_params"]) # shape (num_seeds, num_open_ended_iters, 1, num_ckpts, leaf_dim)
-    ego_policy, init_ego_params = initialize_s5_agent(algorithm_config, env, init_ego_rng)
+    ego_policy, init_ego_params = initialize_s5_agent(ego_config, env, init_ego_rng)
 
     return ego_policy, ego_params, init_ego_params
 

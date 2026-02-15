@@ -2,8 +2,8 @@ defaults:
   - rotate_with_mixed_play/_base_
   - _self_ # values from this file override the values from the base file
 
-TIMESTEPS_PER_ITER_PARTNER: 2e5 # per iter of open-ended training, divided between 4 types of rollouts and all partner seeds
-TIMESTEPS_PER_ITER_EGO: 2e5
+TIMESTEPS_PER_ITER_PARTNER: 1e4 # per iter of open-ended training, divided between 4 types of rollouts and all partner seeds
+TIMESTEPS_PER_ITER_EGO: 1e4
 NUM_OPEN_ENDED_ITERS: 10
 LR: 1e-4
 CLIP_EPS: 0.1

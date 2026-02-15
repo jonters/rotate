@@ -2,8 +2,8 @@ defaults:
   - rotate/_base_
   - _self_ # values from this file override the values from the base file
 
-TIMESTEPS_PER_ITER_PARTNER: 2e5 # per iter of open-ended training, divided between conf-br and conf-ego and between all partner seeds
-TIMESTEPS_PER_ITER_EGO: 2e5
+TIMESTEPS_PER_ITER_PARTNER: 1e4 # per iter of open-ended training, divided between conf-br and conf-ego and between all partner seeds
+TIMESTEPS_PER_ITER_EGO: 1e4
 NUM_OPEN_ENDED_ITERS: 10
 REGRET_SP_WEIGHT: 2.0 # weight on the SP term in the perstep regret loss
 LR: 1e-4
@@ -21,6 +21,6 @@ EGO_ARGS:
   S5_ACTOR_CRITIC_HIDDEN_DIM: 1024
   FC_N_LAYERS: 3
 PRETRAIN_ARGS:
-  TOTAL_TIMESTEPS: 2e5 # timesteps to split between IPPO partners
+  TOTAL_TIMESTEPS: 1e4 # timesteps to split between IPPO partners
   NUM_AGENTS: 3 # number of IPPO partners to pretrain
   NUM_CHECKPOINTS: 2 # number of checkpoints to save for each IPPO partner

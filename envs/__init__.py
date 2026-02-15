@@ -76,7 +76,14 @@ def make_env(env_name: str, env_kwargs: dict = {}):
             "num_cards_of_rank": np.array([3, 2, 2, 2, 1]),
         }
 
-        from envs.hanabi.hanabi_wrapper import HanabiWrapper
+        # Import HanabiWrapper from this project's directory explicitly
+        import importlib.util
+        import os
+        _hanabi_wrapper_path = os.path.join(os.path.dirname(__file__), "hanabi", "hanabi_wrapper.py")
+        _spec = importlib.util.spec_from_file_location("hanabi_wrapper", _hanabi_wrapper_path)
+        _hanabi_wrapper_module = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_hanabi_wrapper_module)
+        HanabiWrapper = _hanabi_wrapper_module.HanabiWrapper
 
         env_kwargs = default_env_kwargs
         env = HanabiWrapper(**env_kwargs)

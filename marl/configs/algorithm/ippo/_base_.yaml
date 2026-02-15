@@ -9,3 +9,4 @@ GAE_LAMBDA: 0.95
 VF_COEF: 0.5
 MAX_GRAD_NORM: 1.0
 ANNEAL_LR: True
+PRECOMPUTE_RESET_STATES: false  # If true, pre-compute reset states before env.step (for speed testing)
