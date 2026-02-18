@@ -100,20 +100,27 @@ def make_train(config, env):
         # Use pre-initialized env state
         obsv, env_state = init_obsv, init_env_state
 
-        NUM_RESETS = config.get("NUM_RESETS", 20)  # configurable buffer size
+        # Toggle between precomputed reset buffer vs on-the-fly reset
+        USE_RESET_BUFFER = True  # Set to False for original behavior (reset computed each step)
+        NUM_RESETS = config.get("NUM_RESETS", 20)  # buffer size (only used if USE_RESET_BUFFER=True)
 
         # TRAIN LOOP
         def _update_step(update_runner_state, unused):
             runner_state, update_steps = update_runner_state
             
-            # Generate fresh reset buffer for this update step
             train_state, env_state_inner, last_obs, last_done, last_hstate, reset_idx, rng = runner_state
-            rng, reset_buffer_rng = jax.random.split(rng)
-            reset_rngs = jax.random.split(reset_buffer_rng, config["NUM_ENVS"] * NUM_RESETS)
-            reset_rngs = reset_rngs.reshape(config["NUM_ENVS"], NUM_RESETS, -1)
-            reset_buffer = jax.vmap(jax.vmap(env.reset, in_axes=(0,)), in_axes=(0,))(reset_rngs)
-            # Also reset the indices to 0 for the fresh buffer
-            reset_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
+            
+            if USE_RESET_BUFFER:
+                # Generate fresh reset buffer for this update step
+                rng, reset_buffer_rng = jax.random.split(rng)
+                reset_rngs = jax.random.split(reset_buffer_rng, config["NUM_ENVS"] * NUM_RESETS)
+                reset_rngs = reset_rngs.reshape(config["NUM_ENVS"], NUM_RESETS, -1)
+                reset_buffer = jax.vmap(jax.vmap(env.reset, in_axes=(0,)), in_axes=(0,))(reset_rngs)
+                # Also reset the indices to 0 for the fresh buffer
+                reset_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
+            else:
+                reset_buffer = None
+                
             runner_state = (train_state, env_state_inner, last_obs, last_done, last_hstate, reset_idx, rng)
 
             def _env_step(runner_state, unused):
@@ -154,12 +161,16 @@ def make_train(config, env):
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
 
                 with jax.named_scope("env_step_call"):
-                    # reset_buffer[0] is obs with shape (NUM_ENVS, NUM_RESETS, ...)
-                    # reset_buffer[1] is state with shape (NUM_ENVS, NUM_RESETS, ...)
-                    # reset_idx is (NUM_ENVS,) - each env has its own index
-                    new_obs, new_env_state, reward, new_done, info, new_reset_idx = jax.vmap(
-                        env.step, in_axes=(0, 0, 0, 0, 0, None)
-                    )(rng_step, env_state, env_act, reset_buffer, reset_idx, NUM_RESETS)
+                    if USE_RESET_BUFFER:
+                        # Use precomputed reset buffer
+                        new_obs, new_env_state, reward, new_done, info, new_reset_idx = jax.vmap(
+                            env.step, in_axes=(0, 0, 0, 0, 0, None)
+                        )(rng_step, env_state, env_act, reset_buffer, reset_idx, NUM_RESETS)
+                    else:
+                        # Original behavior: pass None, reset computed on-the-fly
+                        new_obs, new_env_state, reward, new_done, info, new_reset_idx = jax.vmap(
+                            env.step, in_axes=(0, 0, 0, None, None, None)
+                        )(rng_step, env_state, env_act, None, None, None)
                 
                 # note that num_actors = num_envs * num_agents
                 with jax.named_scope("build_transition"):
@@ -399,9 +410,8 @@ def run_ippo(config, logger):
     import time
     import os
 
-    # Create trace directory
-    trace_dir = f"/tmp/jax-trace-ippo-{algorithm_config['ENV_NAME']}"
-    os.makedirs(trace_dir, exist_ok=True)
+    # Toggle profiling mode
+    PROFILE_MODE = False  # Set to True for warmup + profiling, False for simple run
 
     # Separate init_env from train to make them visible in profiler
     init_env_fn, train_fn = make_train(algorithm_config, env)
@@ -413,32 +423,44 @@ def run_ippo(config, logger):
     # Split rngs for init and train
     init_rngs, train_rngs = jax.vmap(lambda r: jax.random.split(r))(rngs).transpose((1, 0, 2))
 
-    # Warm-up run to separate JIT compilation from execution
-    print("Warming up (JIT compilation)...")
-    st = time.time()
-    init_obsv, init_env_state = init_env_jit(init_rngs)
-    jax.tree.map(lambda x: x.block_until_ready(), (init_obsv, init_env_state))
-    print(f"Init env warm-up time: {time.time() - st:.2f}s")
-    
-    st = time.time()
-    out = train_jit(train_rngs, init_obsv, init_env_state)
-    jax.tree.map(lambda x: x.block_until_ready(), out)
-    print(f"Train warm-up time (includes JIT compile): {time.time() - st:.2f}s")
+    if PROFILE_MODE:
+        # Create trace directory
+        trace_dir = f"/tmp/jax-trace-ippo-{algorithm_config['ENV_NAME']}"
+        os.makedirs(trace_dir, exist_ok=True)
 
-    # Profiled run - re-init env to capture it in trace
-    print(f"Running with profiler... (trace will be saved to {trace_dir})")
-    st = time.time()
-    with jax.profiler.trace(trace_dir):
-        # Init env (separate from train loop)
+        # Warm-up run to separate JIT compilation from execution
+        print("Warming up (JIT compilation)...")
+        st = time.time()
         init_obsv, init_env_state = init_env_jit(init_rngs)
         jax.tree.map(lambda x: x.block_until_ready(), (init_obsv, init_env_state))
+        print(f"Init env warm-up time: {time.time() - st:.2f}s")
         
-        # Train loop
+        st = time.time()
         out = train_jit(train_rngs, init_obsv, init_env_state)
         jax.tree.map(lambda x: x.block_until_ready(), out)
-    
-    print(f"Total training time (s): {time.time() - st:.2f}")
-    print(f"\nTo view the trace, run:\n  tensorboard --logdir={trace_dir}")
+        print(f"Train warm-up time (includes JIT compile): {time.time() - st:.2f}s")
+
+        # Profiled run - re-init env to capture it in trace
+        print(f"Running with profiler... (trace will be saved to {trace_dir})")
+        st = time.time()
+        with jax.profiler.trace(trace_dir):
+            # Init env (separate from train loop)
+            init_obsv, init_env_state = init_env_jit(init_rngs)
+            jax.tree.map(lambda x: x.block_until_ready(), (init_obsv, init_env_state))
+            
+            # Train loop
+            out = train_jit(train_rngs, init_obsv, init_env_state)
+            jax.tree.map(lambda x: x.block_until_ready(), out)
+        
+        print(f"Total training time (s): {time.time() - st:.2f}")
+        print(f"\nTo view the trace, run:\n  tensorboard --logdir={trace_dir}")
+    else:
+        # Simple run without profiling
+        st = time.time()
+        init_obsv, init_env_state = init_env_jit(init_rngs)
+        out = train_jit(train_rngs, init_obsv, init_env_state)
+        jax.tree.map(lambda x: x.block_until_ready(), out)
+        print(f"Total training time (s): {time.time() - st:.2f}")
 
     log_metrics(config, out, logger)
     return out
