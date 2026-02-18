@@ -15,12 +15,28 @@ from agents.initialize_agents import initialize_s5_agent, initialize_mlp_agent, 
     initialize_rnn_agent, initialize_pseudo_actor_with_double_critic, initialize_pseudo_actor_with_conditional_critic
 from common.plot_utils import get_stats, get_metric_names
 from common.save_load_utils import save_train_run
-from envs import make_env
 
-# Import LogWrapper from this project's directory explicitly
+# Import make_env from this project's directory explicitly
 import importlib.util
 import os
-_log_wrapper_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "envs", "log_wrapper.py")
+import sys
+
+# First, ensure the parent directory is in sys.path so relative imports work
+_rotate_dir = os.path.dirname(os.path.dirname(__file__))
+if _rotate_dir not in sys.path:
+    sys.path.insert(0, _rotate_dir)
+
+# Now import envs - this will use the local version due to sys.path ordering
+_envs_init_path = os.path.join(_rotate_dir, "envs", "__init__.py")
+_spec = importlib.util.spec_from_file_location("envs", _envs_init_path, 
+    submodule_search_locations=[os.path.join(_rotate_dir, "envs")])
+_envs_module = importlib.util.module_from_spec(_spec)
+sys.modules["envs"] = _envs_module  # Register before exec so internal imports work
+_spec.loader.exec_module(_envs_module)
+make_env = _envs_module.make_env
+
+# Import LogWrapper from this project's directory explicitly
+_log_wrapper_path = os.path.join(_rotate_dir, "envs", "log_wrapper.py")
 _spec = importlib.util.spec_from_file_location("log_wrapper", _log_wrapper_path)
 _log_wrapper_module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_log_wrapper_module)
@@ -84,21 +100,25 @@ def make_train(config, env):
         # Use pre-initialized env state
         obsv, env_state = init_obsv, init_env_state
 
-        # Pre-compute reset states once for benchmarking (reused for all steps)
-        if config.get("PRECOMPUTE_RESET_STATES", False):
-            rng, reset_rng = jax.random.split(rng)
-            reset_rngs = jax.random.split(reset_rng, config["NUM_ENVS"])
-            _, precomputed_reset_states = jax.vmap(env.reset)(reset_rngs)
-        else:
-            precomputed_reset_states = None
+        NUM_RESETS = config.get("NUM_RESETS", 20)  # configurable buffer size
 
         # TRAIN LOOP
         def _update_step(update_runner_state, unused):
             runner_state, update_steps = update_runner_state
+            
+            # Generate fresh reset buffer for this update step
+            train_state, env_state_inner, last_obs, last_done, last_hstate, reset_idx, rng = runner_state
+            rng, reset_buffer_rng = jax.random.split(rng)
+            reset_rngs = jax.random.split(reset_buffer_rng, config["NUM_ENVS"] * NUM_RESETS)
+            reset_rngs = reset_rngs.reshape(config["NUM_ENVS"], NUM_RESETS, -1)
+            reset_buffer = jax.vmap(jax.vmap(env.reset, in_axes=(0,)), in_axes=(0,))(reset_rngs)
+            # Also reset the indices to 0 for the fresh buffer
+            reset_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
+            runner_state = (train_state, env_state_inner, last_obs, last_done, last_hstate, reset_idx, rng)
 
             def _env_step(runner_state, unused):
               with jax.named_scope("env_step"):
-                train_state, env_state, last_obs, last_done, last_hstate, rng = runner_state
+                train_state, env_state, last_obs, last_done, last_hstate, reset_idx, rng = runner_state
 
                 rng, act_rng = jax.random.split(rng)
 
@@ -134,17 +154,12 @@ def make_train(config, env):
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
 
                 with jax.named_scope("env_step_call"):
-                    if precomputed_reset_states is not None:
-                        # Use pre-computed reset states (computed once outside loop)
-                        def step_with_reset(key, state, action, reset_state):
-                            return env.step(key, state, action, reset_state)
-                        new_obs, new_env_state, reward, new_done, info = jax.vmap(step_with_reset)(
-                            rng_step, env_state, env_act, precomputed_reset_states
-                        )
-                    else:
-                        new_obs, new_env_state, reward, new_done, info = jax.vmap(env.step, in_axes=(0,0,0))(
-                            rng_step, env_state, env_act
-                        )
+                    # reset_buffer[0] is obs with shape (NUM_ENVS, NUM_RESETS, ...)
+                    # reset_buffer[1] is state with shape (NUM_ENVS, NUM_RESETS, ...)
+                    # reset_idx is (NUM_ENVS,) - each env has its own index
+                    new_obs, new_env_state, reward, new_done, info, new_reset_idx = jax.vmap(
+                        env.step, in_axes=(0, 0, 0, 0, 0, None)
+                    )(rng_step, env_state, env_act, reset_buffer, reset_idx, NUM_RESETS)
                 
                 # note that num_actors = num_envs * num_agents
                 with jax.named_scope("build_transition"):
@@ -160,7 +175,7 @@ def make_train(config, env):
                         info,
                         avail_actions
                     )
-                runner_state = (train_state, new_env_state, new_obs, new_done, new_hstate, rng)
+                runner_state = (train_state, new_env_state, new_obs, new_done, new_hstate, new_reset_idx, rng)
                 return runner_state, transition
             
             runner_state, traj_batch = jax.lax.scan(
@@ -168,7 +183,7 @@ def make_train(config, env):
             )
 
             # Get final value estimate for completed trajectory
-            train_state, env_state, last_obs, last_done, last_hstate, rng = runner_state
+            train_state, env_state, last_obs, last_done, last_hstate, reset_idx, rng = runner_state
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
             last_obs_batch = last_obs_batch.reshape(1, config["NUM_ACTORS"], -1)
             last_done_batch = batchify(last_done, env.agents, config["NUM_ACTORS"])
@@ -297,7 +312,7 @@ def make_train(config, env):
             
             rng = update_state[-1]
             update_steps += 1
-            runner_state = (train_state, env_state, last_obs, last_done, last_hstate, rng)
+            runner_state = (train_state, env_state, last_obs, last_done, last_hstate, reset_idx, rng)
             return (runner_state, update_steps), metric
 
         ckpt_and_eval_interval = config["NUM_UPDATES"] // max(1, config["NUM_CHECKPOINTS"] - 1)
@@ -350,7 +365,8 @@ def make_train(config, env):
         update_steps = 0
         init_hstate = policy.init_hstate(config["NUM_ACTORS"])
         init_done = {k: jnp.zeros((config["NUM_ENVS"]), dtype=bool) for k in env.agents + ["__all__"]}
-        update_runner_state = ((train_state, env_state, obsv, init_done, init_hstate, _rng), update_steps)
+        init_reset_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)  # Each env starts at index 0
+        update_runner_state = ((train_state, env_state, obsv, init_done, init_hstate, init_reset_idx, _rng), update_steps)
         checkpoint_array = init_ckpt_array(train_state.params)
         ckpt_idx = 0
         update_with_ckpt_runner_state = (update_runner_state, checkpoint_array, ckpt_idx)

@@ -44,13 +44,19 @@ class LogWrapper(JaxMARLWrapper):
         key: chex.PRNGKey,
         state: LogEnvState,
         action: Union[int, float],
-        reset_state: Optional[LogEnvState] = None,
-    ) -> Tuple[chex.Array, LogEnvState, float, bool, dict]:
+        reset_state: Optional[Tuple[Dict[str, chex.Array], LogEnvState]] = None,
+        reset_idx: Optional[chex.Array] = None,
+        reset_states_length: Optional[int] = None,
+    ) -> Tuple[chex.Array, LogEnvState, float, bool, dict, chex.Array]:
         # Pass through unwrapped reset_state if provided
-        # reset_state is LogEnvState, reset_state.env_state is WrappedEnvState (for HanabiWrapper)
-        unwrapped_reset_state = reset_state.env_state if reset_state is not None else None
-        obs, env_state, reward, done, info = self._env.step(
-            key, state.env_state, action, unwrapped_reset_state
+        # reset_state is (obs, LogEnvState), HanabiWrapper expects (obs, WrappedEnvState)
+        if reset_state is not None:
+            reset_obs, reset_log_state = reset_state
+            unwrapped_reset_state = (reset_obs, reset_log_state.env_state)
+        else:
+            unwrapped_reset_state = None
+        obs, env_state, reward, done, info, new_reset_idx = self._env.step(
+            key, state.env_state, action, unwrapped_reset_state, reset_idx, reset_states_length
         )
         ep_done = done["__all__"]
         new_episode_return = state.episode_returns + self._batchify_floats(reward)
@@ -83,4 +89,4 @@ class LogWrapper(JaxMARLWrapper):
             ), 
             state)
 
-        return obs, state, reward, done, info
+        return obs, state, reward, done, info, new_reset_idx

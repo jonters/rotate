@@ -67,14 +67,49 @@ class HanabiWrapper(BaseEnv):
         key: chex.PRNGKey,
         state: WrappedEnvState,
         actions: Dict[str, chex.Array],
-        reset_state: Optional[WrappedEnvState] = None,
+        reset_state: Optional[Tuple[Dict[str, chex.Array], WrappedEnvState]] = None,
+        reset_idx: Optional[int] = None,
+        reset_states_length: Optional[int] = None,
     ) -> Tuple[Dict[str, chex.Array], WrappedEnvState, Dict[str, float], Dict[str, bool], Dict]:
-        '''Wrapped step function. The base return is 
-        tracked in the info dictionary, so that the return can be obtained from the final info.
+        '''Wrapped step function with auto-reset handling.
+        
+        Args:
+            key: Random key
+            state: Current wrapped state
+            actions: Agent actions
+            reset_state: Optional precomputed (obs, state) tuple from self.reset().
+                        If provided, uses this for auto-reset instead of calling reset().
+                        This avoids redundant reset computation on GPU where jax.lax.cond
+                        executes both branches when vmapped.
+        
+        The base return is tracked in the info dictionary, so that the return can be 
+        obtained from the final info.
         '''
-        # Pass the unwrapped env_state to the underlying environment
-        reset_env_state = reset_state.env_state if reset_state is not None else None
-        obs, env_state, rewards, dones, infos = self.env.step(key, state.env_state, actions, reset_env_state)
+        key, key_reset = jax.random.split(key)
+        
+        # Run the actual environment step (step_env doesn't auto-reset)
+        obs_st, env_state_st, rewards, dones, infos = self.env.step_env(key, state.env_state, actions)
+        
+        # Auto-reset based on done flag
+        done_all = dones['__all__']
+
+        # Get reset state - either precomputed or computed now
+        if reset_state is not None:
+            obs_re = jax.tree.map(lambda x: x[reset_idx], reset_state[0])
+            wrapped_state_re = jax.tree.map(lambda x: x[reset_idx], reset_state[1])
+            env_state_re = wrapped_state_re.env_state
+
+            new_reset_idx = jax.lax.select(done_all, (reset_idx + 1) % reset_states_length, reset_idx)
+        else:
+            obs_re, env_state_re = self.env.reset(key_reset)
+            new_reset_idx = jnp.array(0)  # Dummy value, won't be used
+        
+        env_state = jax.tree.map(
+            lambda x, y: jax.lax.select(done_all, x, y), env_state_re, env_state_st
+        )
+        obs = jax.tree.map(
+            lambda x, y: jax.lax.select(done_all, x, y), obs_re, obs_st
+        )
         
         # Extract base reward (assuming rewards are the base rewards for Hanabi)
         # Convert rewards dict to array for tracking
@@ -83,12 +118,13 @@ class HanabiWrapper(BaseEnv):
         new_info = {**infos, 'base_return': base_return_so_far, 'base_reward': base_reward}
         
         # handle auto-resetting the base return upon episode termination
-        base_return_so_far = jax.lax.select(dones['__all__'], jnp.zeros(self.num_agents), base_return_so_far)
-        # compute new avail_actions and step
+        base_return_so_far = jax.lax.select(done_all, jnp.zeros(self.num_agents), base_return_so_far)
+        
+        # compute new avail_actions and step (use post-reset state)
         avail_actions = self.env.get_legal_moves(env_state)
         step = env_state.turn
         new_state = WrappedEnvState(env_state=env_state,
                                     base_return_so_far=base_return_so_far,
                                     avail_actions=avail_actions,
                                     step=step)
-        return obs, new_state, rewards, dones, new_info
+        return obs, new_state, rewards, dones, new_info, new_reset_idx
