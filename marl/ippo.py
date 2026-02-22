@@ -62,15 +62,16 @@ def initialize_agent(actor_type, algorithm_config, env, init_rng):
 
 def make_train(config, env):
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
+    config["STEPS_PER_CHUNK"] = config["TOTAL_TIMESTEPS"] // config["TRAIN_CHUNKS"]
     config["NUM_UPDATES"] = (
-        config["TOTAL_TIMESTEPS"] // config["ROLLOUT_LENGTH"] // config["NUM_ENVS"]
+        config["STEPS_PER_CHUNK"] // config["ROLLOUT_LENGTH"] // config["NUM_ENVS"]
     )
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["ROLLOUT_LENGTH"] // config["NUM_MINIBATCHES"]
     )
 
     def linear_schedule(count):
-        frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
+        frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / (config["NUM_UPDATES"] * config["TRAIN_CHUNKS"])
         return config["LR"] * frac
 
     def init_env(rng):
@@ -495,11 +496,9 @@ def run_ippo(config, logger):
 
         from tqdm import tqdm
 
-        TRAIN_CHUNKS = 10    
-
         train_continue_jit = jax.jit(jax.vmap(partial(train_fn, initial=False)))
 
-        for iteration in tqdm(range(2)):
+        for iteration in tqdm(range(algorithm_config["TRAIN_CHUNKS"]), desc="Training Progress"):
             if iteration == 0:
                 init_obsv, init_env_state = init_env_jit(init_rngs)
                 out = train_jit(train_rngs, init_obsv, init_env_state)

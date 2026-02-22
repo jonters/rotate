@@ -3,6 +3,7 @@ defaults:
   - _self_ # values from this file override the values from the base file
 
 TOTAL_TIMESTEPS: 1e6
+TRAIN_CHUNKS: 1
 SEED: 12345
 LR: .0001
 NUM_ENVS: 32
