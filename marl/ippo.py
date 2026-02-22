@@ -21,6 +21,8 @@ import importlib.util
 import os
 import sys
 
+from functools import partial
+
 # First, ensure the parent directory is in sys.path so relative imports work
 _rotate_dir = os.path.dirname(os.path.dirname(__file__))
 if _rotate_dir not in sys.path:
@@ -77,32 +79,34 @@ def make_train(config, env):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         return obsv, env_state
 
-    def train(rng, init_obsv, init_env_state):
-        # INIT NETWORK
-        rng, init_rng = jax.random.split(rng)
-        policy, init_params = initialize_agent(config["ACTOR_TYPE"], config, env, init_rng)
-
-        if config["ANNEAL_LR"]:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
-            )
-        else:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), 
-                optax.adam(config["LR"], eps=1e-5))
-        train_state = TrainState.create(
-            apply_fn=policy.network.apply,
-            params=init_params,
-            tx=tx,
-        )
-
-        # Use pre-initialized env state
-        obsv, env_state = init_obsv, init_env_state
+    def train(rng, init_obsv, init_env_state, initial=True, update_runner_state=None):
 
         # Toggle between precomputed reset buffer vs on-the-fly reset
         USE_RESET_BUFFER = True  # Set to False for original behavior (reset computed each step)
         NUM_RESETS = config.get("NUM_RESETS", 20)  # buffer size (only used if USE_RESET_BUFFER=True)
+
+        rng, init_rng = jax.random.split(rng)
+        policy, init_params = initialize_agent(config["ACTOR_TYPE"], config, env, init_rng)
+
+        if initial:
+            if config["ANNEAL_LR"]:
+                tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                    optax.adam(learning_rate=linear_schedule, eps=1e-5),
+                )
+            else:
+                tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), 
+                    optax.adam(config["LR"], eps=1e-5))
+
+            train_state = TrainState.create(
+                apply_fn=policy.network.apply,
+                params=init_params,
+                tx=tx,
+            )
+
+            # Use pre-initialized env state
+            obsv, env_state = init_obsv, init_env_state
 
         # TRAIN LOOP
         def _update_step(update_runner_state, unused):
@@ -372,12 +376,41 @@ def make_train(config, env):
             return runner_state, metric
 
         # (5) Use lax.scan over NUM_UPDATES
-        rng, _rng = jax.random.split(rng)
-        update_steps = 0
-        init_hstate = policy.init_hstate(config["NUM_ACTORS"])
-        init_done = {k: jnp.zeros((config["NUM_ENVS"]), dtype=bool) for k in env.agents + ["__all__"]}
-        init_reset_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)  # Each env starts at index 0
-        update_runner_state = ((train_state, env_state, obsv, init_done, init_hstate, init_reset_idx, _rng), update_steps)
+        if initial:
+            rng, _rng = jax.random.split(rng)
+            update_steps = 0
+            init_hstate = policy.init_hstate(config["NUM_ACTORS"])
+            init_done = {k: jnp.zeros((config["NUM_ENVS"]), dtype=bool) for k in env.agents + ["__all__"]}
+            init_reset_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)  # Each env starts at index 0
+            update_runner_state = ((train_state, env_state, obsv, init_done, init_hstate, init_reset_idx, _rng), update_steps)
+        else:
+            train_state = update_runner_state[0][0]
+
+            # # Recreate optimizer so LR schedule restarts correctly for this chunk
+            # if config["ANNEAL_LR"]:
+            #     tx = optax.chain(
+            #         optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+            #         optax.adam(learning_rate=linear_schedule, eps=1e-5),
+            #     )
+            # else:
+            #     tx = optax.chain(
+            #         optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+            #         optax.adam(config["LR"], eps=1e-5))
+
+            # # Fresh optimizer state, but keep trained params from previous chunk
+            # train_state = TrainState.create(
+            #     apply_fn=policy.network.apply,
+            #     params=update_runner_state[0][0].params,
+            #     tx=tx,
+            # )
+            # # Replace train_state in runner and reset update_steps to 0
+            # old_runner = update_runner_state[0]
+            # update_runner_state = (
+            #     (train_state, old_runner[1], old_runner[2], old_runner[3],
+            #      old_runner[4], old_runner[5], old_runner[6]),
+            #     0
+            # )
+
         checkpoint_array = init_ckpt_array(train_state.params)
         ckpt_idx = 0
         update_with_ckpt_runner_state = (update_runner_state, checkpoint_array, ckpt_idx)
@@ -392,6 +425,7 @@ def make_train(config, env):
         update_runner_state, checkpoint_array, final_ckpt_idx = runner_state
 
         return {
+            "update_runner_state": update_runner_state,
             "final_params": update_runner_state[0][0].params,
             "metrics": metrics,
             "checkpoints": checkpoint_array,
@@ -455,11 +489,50 @@ def run_ippo(config, logger):
         print(f"Total training time (s): {time.time() - st:.2f}")
         print(f"\nTo view the trace, run:\n  tensorboard --logdir={trace_dir}")
     else:
-        # Simple run without profiling
+        # Run with tqdm without profiling
         st = time.time()
-        init_obsv, init_env_state = init_env_jit(init_rngs)
-        out = train_jit(train_rngs, init_obsv, init_env_state)
-        jax.tree.map(lambda x: x.block_until_ready(), out)
+
+
+        from tqdm import tqdm
+
+        TRAIN_CHUNKS = 10    
+
+        train_continue_jit = jax.jit(jax.vmap(partial(train_fn, initial=False)))
+
+        for iteration in tqdm(range(2)):
+            if iteration == 0:
+                init_obsv, init_env_state = init_env_jit(init_rngs)
+                out = train_jit(train_rngs, init_obsv, init_env_state)
+                jax.tree.map(lambda x: x.block_until_ready(), out)
+            else:
+                update_runner_state = out["update_runner_state"]
+                # TODO: we actually don't need these re-init computations, but its negligble
+                init_obsv, init_env_state = init_env_jit(init_rngs)
+                init_rngs, train_rngs = jax.vmap(lambda r: jax.random.split(r))(rngs).transpose((1, 0, 2))
+                out = train_continue_jit(train_rngs, init_obsv, init_env_state, update_runner_state=update_runner_state)
+                jax.tree.map(lambda x: x.block_until_ready(), out)
+
+
+        # for i in range(TRAIN_CHUNKS):
+        #     print(f"Processing train chunk {i+1}/{TRAIN_CHUNKS}...")
+        #     rngs = jax.random.split(rng, algorithm_config["NUM_SEEDS"])
+        #     init_rngs, train_rngs = jax.vmap(lambda r: jax.random.split(r))(rngs).transpose((1, 0, 2))
+            
+        #     init_obsv, init_env_state = init_env_jit(init_rngs)
+        #     out = train_jit(train_rngs, init_obsv, init_env_state)
+        #     jax.tree.map(lambda x: x.block_until_ready(), out)
+
+        # final_params = out["final_params"]
+        # metrics = out["metrics"]
+        # checkpoint_array = out["checkpoints"]
+        # final_ckpt_idx = out["final_ckpt_idx"]
+        #         return {
+        #     "final_params": update_runner_state[0][0].params,
+        #     "metrics": metrics,
+        #     "checkpoints": checkpoint_array,
+        #     "final_ckpt_idx": final_ckpt_idx # CLEANUP FLAG
+        # }
+
         print(f"Total training time (s): {time.time() - st:.2f}")
 
     log_metrics(config, out, logger)
