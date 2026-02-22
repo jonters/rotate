@@ -387,31 +387,6 @@ def make_train(config, env):
         else:
             train_state = update_runner_state[0][0]
 
-            # # Recreate optimizer so LR schedule restarts correctly for this chunk
-            # if config["ANNEAL_LR"]:
-            #     tx = optax.chain(
-            #         optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-            #         optax.adam(learning_rate=linear_schedule, eps=1e-5),
-            #     )
-            # else:
-            #     tx = optax.chain(
-            #         optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-            #         optax.adam(config["LR"], eps=1e-5))
-
-            # # Fresh optimizer state, but keep trained params from previous chunk
-            # train_state = TrainState.create(
-            #     apply_fn=policy.network.apply,
-            #     params=update_runner_state[0][0].params,
-            #     tx=tx,
-            # )
-            # # Replace train_state in runner and reset update_steps to 0
-            # old_runner = update_runner_state[0]
-            # update_runner_state = (
-            #     (train_state, old_runner[1], old_runner[2], old_runner[3],
-            #      old_runner[4], old_runner[5], old_runner[6]),
-            #     0
-            # )
-
         checkpoint_array = init_ckpt_array(train_state.params)
         ckpt_idx = 0
         update_with_ckpt_runner_state = (update_runner_state, checkpoint_array, ckpt_idx)
@@ -493,10 +468,12 @@ def run_ippo(config, logger):
         # Run with tqdm without profiling
         st = time.time()
 
-
         from tqdm import tqdm
 
         train_continue_jit = jax.jit(jax.vmap(partial(train_fn, initial=False)))
+
+        steps_per_chunk = algorithm_config["TOTAL_TIMESTEPS"] // algorithm_config["TRAIN_CHUNKS"]
+        num_updates_per_chunk = steps_per_chunk // algorithm_config["ROLLOUT_LENGTH"] // algorithm_config["NUM_ENVS"]
 
         for iteration in tqdm(range(algorithm_config["TRAIN_CHUNKS"]), desc="Training Progress"):
             if iteration == 0:
@@ -511,35 +488,18 @@ def run_ippo(config, logger):
                 out = train_continue_jit(train_rngs, init_obsv, init_env_state, update_runner_state=update_runner_state)
                 jax.tree.map(lambda x: x.block_until_ready(), out)
 
-
-        # for i in range(TRAIN_CHUNKS):
-        #     print(f"Processing train chunk {i+1}/{TRAIN_CHUNKS}...")
-        #     rngs = jax.random.split(rng, algorithm_config["NUM_SEEDS"])
-        #     init_rngs, train_rngs = jax.vmap(lambda r: jax.random.split(r))(rngs).transpose((1, 0, 2))
-            
-        #     init_obsv, init_env_state = init_env_jit(init_rngs)
-        #     out = train_jit(train_rngs, init_obsv, init_env_state)
-        #     jax.tree.map(lambda x: x.block_until_ready(), out)
-
-        # final_params = out["final_params"]
-        # metrics = out["metrics"]
-        # checkpoint_array = out["checkpoints"]
-        # final_ckpt_idx = out["final_ckpt_idx"]
-        #         return {
-        #     "final_params": update_runner_state[0][0].params,
-        #     "metrics": metrics,
-        #     "checkpoints": checkpoint_array,
-        #     "final_ckpt_idx": final_ckpt_idx # CLEANUP FLAG
-        # }
+            # Log this chunk's metrics to wandb immediately, then free them
+            step_offset = iteration * num_updates_per_chunk
+            log_metrics_to_wandb(config, out["metrics"], logger, step_offset=step_offset)
 
         print(f"Total training time (s): {time.time() - st:.2f}")
 
-    log_metrics(config, out, logger)
+    logger.commit()
+    save_artifacts(config, out, logger)
     return out
 
-def log_metrics(config, out, logger):
-    '''Save train run output and log to wandb as artifact.'''    
-    train_metrics = out["metrics"]
+def log_metrics_to_wandb(config, train_metrics, logger, step_offset=0):
+    '''Log a single chunk's metrics to wandb. Called per chunk so memory can be freed.'''
     metric_names = get_metric_names(config["ENV_NAME"])
     train_stats = get_stats(train_metrics, metric_names)
 
@@ -547,22 +507,19 @@ def log_metrics(config, out, logger):
     # where the last dimension contains the mean and std of the metric
     train_stats = {k: np.mean(np.array(v), axis=0) for k, v in train_stats.items()}
 
-    # Log metrics for each update step
-    num_updates = train_metrics["returned_episode"].shape[1] # shape is (num_seeds, num_updates, rollout_len, num_envs*num_agents_per_game)
+    # Log metrics for each update step with global step offset
+    num_updates = train_metrics["returned_episode"].shape[1]
     for step in range(num_updates):
         for stat_name, stat_data in train_stats.items():
-            # second dimension contains the mean and std of the metric
             stat_mean = stat_data[step, 0]
-            logger.log_item(f"Train/{stat_name}", stat_mean, train_step=step, commit=True)
+            logger.log_item(f"Train/{stat_name}", stat_mean, train_step=step_offset + step, commit=True)
 
-    logger.commit()
-
-    # save artifacts
+def save_artifacts(config, out, logger):
+    '''Save train run output and log to wandb as artifact. Called once at the end.'''
     savedir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
     out_savepath = save_train_run(out, savedir, savename="saved_train_run")
     if config["logger"]["log_train_out"]:
         logger.log_artifact(name="saved_train_run", path=out_savepath, type_name="train_run")
-        # Cleanup locally logged out file
     if not config["local_logger"]["save_train_out"]:
         shutil.rmtree(out_savepath)
    
