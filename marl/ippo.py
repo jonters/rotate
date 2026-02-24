@@ -24,20 +24,28 @@ from functools import partial
 from marl.ppo_utils import Transition, batchify, unbatchify, _create_minibatches
 
 from jax.sharding import Mesh, PartitionSpec as PS, NamedSharding
-from jax.experimental import mesh_utils
+
+# Number of GPUs to shard across (set to 1 to disable sharding)
+NUM_DEVICES = jax.device_count()  # Set to 1 to disable sharding
 
 def get_sharding():
-    devices = jax.device_count()
-    print(f"Number of devices: {devices}")
+    """Create sharding specs for seed-parallel training.
+    
+    Each seed runs entirely independently on one device — no cross-device
+    communication needed. PS("data") shards the outer (seed) axis of the
+    vmapped computation across devices.
+    """
+    devices = NUM_DEVICES
+    print(f"Number of devices to use: {devices}")
 
-    device_mesh = Mesh(mesh_utils.create_device_mesh((devices,),), axis_names=["data"])
-    params_sharding = NamedSharding(device_mesh, PS()) # empty PS --> replicate across all devices
-    data_sharding = NamedSharding(device_mesh, PS("data")) # shard across "data" axis
+    # Select subset of devices if NUM_DEVICES < total available
+    all_devices = jax.devices()
+    selected_devices = all_devices[:devices]
+    
+    device_mesh = Mesh(np.array(selected_devices).reshape((devices,)), axis_names=["data"])
+    data_sharding = NamedSharding(device_mesh, PS("data")) # shard seeds across devices
 
-    # params are replicated across all devices (obviously)
-    # JAX automatically handles gradient updates for this replicated params
-
-    return params_sharding, data_sharding
+    return data_sharding
 
 
 def initialize_agent(actor_type, algorithm_config, env, init_rng):
@@ -53,7 +61,7 @@ def initialize_agent(actor_type, algorithm_config, env, init_rng):
         policy, init_params = initialize_pseudo_actor_with_conditional_critic(algorithm_config, env, init_rng)
     return policy, init_params
 
-def make_train(config, env, sharding=None):
+def make_train(config, env):
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["STEPS_PER_CHUNK"] = config["TOTAL_TIMESTEPS"] // config["TRAIN_CHUNKS"]
     config["NUM_UPDATES"] = (
@@ -62,12 +70,6 @@ def make_train(config, env, sharding=None):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["ROLLOUT_LENGTH"] // config["NUM_MINIBATCHES"]
     )
-
-    # Get sharding specs for multi-device training
-    if sharding is not None:
-        params_sharding, data_sharding = sharding
-    else:
-        params_sharding, data_sharding = None, None
 
     def linear_schedule(count):
         frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / (config["NUM_UPDATES"] * config["TRAIN_CHUNKS"])
@@ -82,9 +84,6 @@ def make_train(config, env, sharding=None):
         """Initialize environment state - kept separate from train for profiling."""
         reset_rng = jax.random.split(rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
-        # Apply sharding constraint to distribute env data across devices
-        obsv = jax.lax.with_sharding_constraint(obsv, data_sharding)
-        env_state = jax.lax.with_sharding_constraint(env_state, data_sharding)
         return obsv, env_state
 
     def train(rng, init_obsv, init_env_state, initial=True, update_runner_state=None):
@@ -112,10 +111,8 @@ def make_train(config, env, sharding=None):
                 params=init_params,
                 tx=tx,
             )
-            # Replicate params across all devices
-            train_state = jax.lax.with_sharding_constraint(train_state, params_sharding)
 
-            # Use pre-initialized env state (already sharded from init_env)
+            # Use pre-initialized env state
             obsv, env_state = init_obsv, init_env_state
 
         # TRAIN LOOP
@@ -130,8 +127,6 @@ def make_train(config, env, sharding=None):
                 reset_rngs = jax.random.split(reset_buffer_rng, config["NUM_ENVS"] * NUM_RESETS)
                 reset_rngs = reset_rngs.reshape(config["NUM_ENVS"], NUM_RESETS, -1)
                 reset_buffer = jax.vmap(jax.vmap(env.reset, in_axes=(0,)), in_axes=(0,))(reset_rngs)
-                # Apply sharding to reset buffer
-                reset_buffer = jax.lax.with_sharding_constraint(reset_buffer, data_sharding)
                 # Also reset the indices to 0 for the fresh buffer
                 reset_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
             else:
@@ -208,8 +203,6 @@ def make_train(config, env, sharding=None):
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["ROLLOUT_LENGTH"]
             )
-            # Apply sharding constraint to trajectory batch for distributed training
-            traj_batch = jax.lax.with_sharding_constraint(traj_batch, data_sharding)
 
             # Get final value estimate for completed trajectory
             train_state, env_state, last_obs, last_done, last_hstate, reset_idx, rng = runner_state
@@ -433,32 +426,32 @@ def run_ippo(config, logger):
     import time
     import os
 
-    # Toggle profiling mode
+    # Toggle modes
     PROFILE_MODE = False  # Set to True for warmup + profiling, False for simple run
-
-    # Get sharding specs for multi-device training
-    params_sharding, data_sharding = get_sharding()
-    sharding = (params_sharding, data_sharding)
-
-    # Validate config values are divisible by number of devices for proper sharding
-    num_devices = jax.device_count()
-    assert algorithm_config["NUM_ENVS"] % num_devices == 0, \
-        f"NUM_ENVS ({algorithm_config['NUM_ENVS']}) must be divisible by num_devices ({num_devices})"
-    assert algorithm_config["NUM_SEEDS"] % num_devices == 0, \
-        f"NUM_SEEDS ({algorithm_config['NUM_SEEDS']}) must be divisible by num_devices ({num_devices})"
+    SHARDED_MODE = False  # Set to True to shard seeds across GPUs
 
     # Separate init_env from train to make them visible in profiler
-    init_env_fn, train_fn = make_train(algorithm_config, env, sharding=sharding)
-    
-    # JIT compile separately - init_env is NOT jitted with train
-    # out_shardings ensures outputs are properly sharded across devices
-    init_env_jit = jax.jit(jax.vmap(init_env_fn), out_shardings=data_sharding)
-    train_jit = jax.jit(jax.vmap(train_fn))
+    init_env_fn, train_fn = make_train(algorithm_config, env)
 
     # Split rngs for init and train
     init_rngs, train_rngs = jax.vmap(lambda r: jax.random.split(r))(rngs).transpose((1, 0, 2))
 
     if PROFILE_MODE:
+        # Sharded profiling: shard seeds across devices
+        data_sharding = get_sharding()
+        assert algorithm_config["NUM_SEEDS"] % NUM_DEVICES == 0, \
+            f"NUM_SEEDS ({algorithm_config['NUM_SEEDS']}) must be divisible by num_devices ({NUM_DEVICES})"
+
+        init_env_jit = jax.jit(jax.vmap(init_env_fn),
+                               in_shardings=data_sharding,
+                               out_shardings=data_sharding)
+        train_jit = jax.jit(jax.vmap(train_fn),
+                            in_shardings=(data_sharding, data_sharding, data_sharding),
+                            out_shardings=data_sharding)
+
+        init_rngs = jax.device_put(init_rngs, data_sharding)
+        train_rngs = jax.device_put(train_rngs, data_sharding)
+
         # Create trace directory
         trace_dir = f"/tmp/jax-trace-ippo-{algorithm_config['ENV_NAME']}"
         os.makedirs(trace_dir, exist_ok=True)
@@ -479,23 +472,36 @@ def run_ippo(config, logger):
         print(f"Running with profiler... (trace will be saved to {trace_dir})")
         st = time.time()
         with jax.profiler.trace(trace_dir):
-            # Init env (separate from train loop)
             init_obsv, init_env_state = init_env_jit(init_rngs)
             jax.tree.map(lambda x: x.block_until_ready(), (init_obsv, init_env_state))
-            
-            # Train loop
             out = train_jit(train_rngs, init_obsv, init_env_state)
             jax.tree.map(lambda x: x.block_until_ready(), out)
         
         print(f"Total training time (s): {time.time() - st:.2f}")
         print(f"\nTo view the trace, run:\n  tensorboard --logdir={trace_dir}")
-    else:
-        # Run with tqdm without profiling
+    elif SHARDED_MODE:
+        # Seed-parallel sharding: each seed runs independently on one device
+        data_sharding = get_sharding()
+        assert algorithm_config["NUM_SEEDS"] % NUM_DEVICES == 0, \
+            f"NUM_SEEDS ({algorithm_config['NUM_SEEDS']}) must be divisible by num_devices ({NUM_DEVICES})"
+
+        init_env_jit = jax.jit(jax.vmap(init_env_fn),
+                               in_shardings=data_sharding,
+                               out_shardings=data_sharding)
+        train_jit = jax.jit(jax.vmap(train_fn),
+                            in_shardings=(data_sharding, data_sharding, data_sharding),
+                            out_shardings=data_sharding)
+        def train_continue(rng, init_obsv, init_env_state, update_runner_state):
+            return train_fn(rng, init_obsv, init_env_state, initial=False, update_runner_state=update_runner_state)
+        train_continue_jit = jax.jit(jax.vmap(train_continue),
+                                     in_shardings=(data_sharding, data_sharding, data_sharding, data_sharding),
+                                     out_shardings=data_sharding)
+
+        init_rngs = jax.device_put(init_rngs, data_sharding)
+        train_rngs = jax.device_put(train_rngs, data_sharding)
+
         st = time.time()
-
         from tqdm import tqdm
-
-        train_continue_jit = jax.jit(jax.vmap(partial(train_fn, initial=False)))
 
         steps_per_chunk = algorithm_config["TOTAL_TIMESTEPS"] // algorithm_config["TRAIN_CHUNKS"]
         num_updates_per_chunk = steps_per_chunk // algorithm_config["ROLLOUT_LENGTH"] // algorithm_config["NUM_ENVS"]
@@ -507,7 +513,37 @@ def run_ippo(config, logger):
                 jax.tree.map(lambda x: x.block_until_ready(), out)
             else:
                 update_runner_state = out["update_runner_state"]
-                # TODO: we actually don't need these re-init computations, but its negligble
+                init_obsv, init_env_state = init_env_jit(init_rngs)
+                init_rngs, train_rngs = jax.vmap(lambda r: jax.random.split(r))(rngs).transpose((1, 0, 2))
+                init_rngs = jax.device_put(init_rngs, data_sharding)
+                train_rngs = jax.device_put(train_rngs, data_sharding)
+                out = train_continue_jit(train_rngs, init_obsv, init_env_state, update_runner_state)
+                jax.tree.map(lambda x: x.block_until_ready(), out)
+
+            # Log this chunk's metrics to wandb immediately, then free them
+            step_offset = iteration * num_updates_per_chunk
+            log_metrics_to_wandb(config, out["metrics"], logger, step_offset=step_offset)
+
+        print(f"Total training time (s): {time.time() - st:.2f}")
+    else:
+        # Single-device mode: no sharding, plain jit + vmap
+        init_env_jit = jax.jit(jax.vmap(init_env_fn))
+        train_jit = jax.jit(jax.vmap(train_fn))
+        train_continue_jit = jax.jit(jax.vmap(partial(train_fn, initial=False)))
+
+        st = time.time()
+        from tqdm import tqdm
+
+        steps_per_chunk = algorithm_config["TOTAL_TIMESTEPS"] // algorithm_config["TRAIN_CHUNKS"]
+        num_updates_per_chunk = steps_per_chunk // algorithm_config["ROLLOUT_LENGTH"] // algorithm_config["NUM_ENVS"]
+
+        for iteration in tqdm(range(algorithm_config["TRAIN_CHUNKS"]), desc="Training Progress"):
+            if iteration == 0:
+                init_obsv, init_env_state = init_env_jit(init_rngs)
+                out = train_jit(train_rngs, init_obsv, init_env_state)
+                jax.tree.map(lambda x: x.block_until_ready(), out)
+            else:
+                update_runner_state = out["update_runner_state"]
                 init_obsv, init_env_state = init_env_jit(init_rngs)
                 init_rngs, train_rngs = jax.vmap(lambda r: jax.random.split(r))(rngs).transpose((1, 0, 2))
                 out = train_continue_jit(train_rngs, init_obsv, init_env_state, update_runner_state=update_runner_state)
