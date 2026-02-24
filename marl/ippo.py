@@ -16,35 +16,28 @@ from agents.initialize_agents import initialize_s5_agent, initialize_mlp_agent, 
 from common.plot_utils import get_stats, get_metric_names
 from common.save_load_utils import save_train_run
 
-# Import make_env from this project's directory explicitly
-import importlib.util
-import os
-import sys
+from envs import make_env
+from envs.log_wrapper import LogWrapper
 
 from functools import partial
 
-# First, ensure the parent directory is in sys.path so relative imports work
-_rotate_dir = os.path.dirname(os.path.dirname(__file__))
-if _rotate_dir not in sys.path:
-    sys.path.insert(0, _rotate_dir)
-
-# Now import envs - this will use the local version due to sys.path ordering
-_envs_init_path = os.path.join(_rotate_dir, "envs", "__init__.py")
-_spec = importlib.util.spec_from_file_location("envs", _envs_init_path, 
-    submodule_search_locations=[os.path.join(_rotate_dir, "envs")])
-_envs_module = importlib.util.module_from_spec(_spec)
-sys.modules["envs"] = _envs_module  # Register before exec so internal imports work
-_spec.loader.exec_module(_envs_module)
-make_env = _envs_module.make_env
-
-# Import LogWrapper from this project's directory explicitly
-_log_wrapper_path = os.path.join(_rotate_dir, "envs", "log_wrapper.py")
-_spec = importlib.util.spec_from_file_location("log_wrapper", _log_wrapper_path)
-_log_wrapper_module = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_log_wrapper_module)
-LogWrapper = _log_wrapper_module.LogWrapper
-
 from marl.ppo_utils import Transition, batchify, unbatchify, _create_minibatches
+
+from jax.sharding import Mesh, PartitionSpec as PS, NamedSharding
+from jax.experimental import mesh_utils
+
+def get_sharding():
+    devices = jax.device_count()
+    print(f"Number of devices: {devices}")
+
+    device_mesh = Mesh(mesh_utils.create_device_mesh((devices,),), axis_names=["data"])
+    params_sharding = NamedSharding(device_mesh, PS()) # empty PS --> replicate across all devices
+    data_sharding = NamedSharding(device_mesh, PS("data")) # shard across "data" axis
+
+    # params are replicated across all devices (obviously)
+    # JAX automatically handles gradient updates for this replicated params
+
+    return params_sharding, data_sharding
 
 
 def initialize_agent(actor_type, algorithm_config, env, init_rng):
@@ -60,7 +53,7 @@ def initialize_agent(actor_type, algorithm_config, env, init_rng):
         policy, init_params = initialize_pseudo_actor_with_conditional_critic(algorithm_config, env, init_rng)
     return policy, init_params
 
-def make_train(config, env):
+def make_train(config, env, sharding=None):
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["STEPS_PER_CHUNK"] = config["TOTAL_TIMESTEPS"] // config["TRAIN_CHUNKS"]
     config["NUM_UPDATES"] = (
@@ -70,14 +63,28 @@ def make_train(config, env):
         config["NUM_ACTORS"] * config["ROLLOUT_LENGTH"] // config["NUM_MINIBATCHES"]
     )
 
+    # Get sharding specs for multi-device training
+    if sharding is not None:
+        params_sharding, data_sharding = sharding
+    else:
+        params_sharding, data_sharding = None, None
+
     def linear_schedule(count):
         frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / (config["NUM_UPDATES"] * config["TRAIN_CHUNKS"])
+        return config["LR"] * frac
+
+    def cosine_schedule(count):
+        progress = (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / (config["NUM_UPDATES"] * config["TRAIN_CHUNKS"])
+        frac = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
         return config["LR"] * frac
 
     def init_env(rng):
         """Initialize environment state - kept separate from train for profiling."""
         reset_rng = jax.random.split(rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+        # Apply sharding constraint to distribute env data across devices
+        obsv = jax.lax.with_sharding_constraint(obsv, data_sharding)
+        env_state = jax.lax.with_sharding_constraint(env_state, data_sharding)
         return obsv, env_state
 
     def train(rng, init_obsv, init_env_state, initial=True, update_runner_state=None):
@@ -93,7 +100,7 @@ def make_train(config, env):
             if config["ANNEAL_LR"]:
                 tx = optax.chain(
                     optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                    optax.adam(learning_rate=linear_schedule, eps=1e-5),
+                    optax.adam(learning_rate=cosine_schedule, eps=1e-5),
                 )
             else:
                 tx = optax.chain(
@@ -105,8 +112,10 @@ def make_train(config, env):
                 params=init_params,
                 tx=tx,
             )
+            # Replicate params across all devices
+            train_state = jax.lax.with_sharding_constraint(train_state, params_sharding)
 
-            # Use pre-initialized env state
+            # Use pre-initialized env state (already sharded from init_env)
             obsv, env_state = init_obsv, init_env_state
 
         # TRAIN LOOP
@@ -121,6 +130,8 @@ def make_train(config, env):
                 reset_rngs = jax.random.split(reset_buffer_rng, config["NUM_ENVS"] * NUM_RESETS)
                 reset_rngs = reset_rngs.reshape(config["NUM_ENVS"], NUM_RESETS, -1)
                 reset_buffer = jax.vmap(jax.vmap(env.reset, in_axes=(0,)), in_axes=(0,))(reset_rngs)
+                # Apply sharding to reset buffer
+                reset_buffer = jax.lax.with_sharding_constraint(reset_buffer, data_sharding)
                 # Also reset the indices to 0 for the fresh buffer
                 reset_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
             else:
@@ -197,6 +208,8 @@ def make_train(config, env):
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["ROLLOUT_LENGTH"]
             )
+            # Apply sharding constraint to trajectory batch for distributed training
+            traj_batch = jax.lax.with_sharding_constraint(traj_batch, data_sharding)
 
             # Get final value estimate for completed trajectory
             train_state, env_state, last_obs, last_done, last_hstate, reset_idx, rng = runner_state
@@ -423,11 +436,23 @@ def run_ippo(config, logger):
     # Toggle profiling mode
     PROFILE_MODE = False  # Set to True for warmup + profiling, False for simple run
 
+    # Get sharding specs for multi-device training
+    params_sharding, data_sharding = get_sharding()
+    sharding = (params_sharding, data_sharding)
+
+    # Validate config values are divisible by number of devices for proper sharding
+    num_devices = jax.device_count()
+    assert algorithm_config["NUM_ENVS"] % num_devices == 0, \
+        f"NUM_ENVS ({algorithm_config['NUM_ENVS']}) must be divisible by num_devices ({num_devices})"
+    assert algorithm_config["NUM_SEEDS"] % num_devices == 0, \
+        f"NUM_SEEDS ({algorithm_config['NUM_SEEDS']}) must be divisible by num_devices ({num_devices})"
+
     # Separate init_env from train to make them visible in profiler
-    init_env_fn, train_fn = make_train(algorithm_config, env)
+    init_env_fn, train_fn = make_train(algorithm_config, env, sharding=sharding)
     
     # JIT compile separately - init_env is NOT jitted with train
-    init_env_jit = jax.jit(jax.vmap(init_env_fn))
+    # out_shardings ensures outputs are properly sharded across devices
+    init_env_jit = jax.jit(jax.vmap(init_env_fn), out_shardings=data_sharding)
     train_jit = jax.jit(jax.vmap(train_fn))
 
     # Split rngs for init and train
