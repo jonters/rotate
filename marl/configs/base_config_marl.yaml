@@ -37,3 +37,8 @@ logger:
 local_logger:
   save_train_out: true
   save_eval_out: true
+
+# NUM_ENVS sweep (set sweep_num_envs to a list to activate)
+# Usage: python run.py sweep_num_envs=[1,2,4,8,16,32,64,128,256]
+sweep_num_envs: [32, 64, 128, 256, 512, 1024]
+sweep_time_limit_minutes: 15

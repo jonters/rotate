@@ -26,7 +26,7 @@ from marl.ppo_utils import Transition, batchify, unbatchify, _create_minibatches
 from jax.sharding import Mesh, PartitionSpec as PS, NamedSharding
 
 # Number of GPUs to shard across (set to 1 to disable sharding)
-NUM_DEVICES = jax.device_count()  # Set to 1 to disable sharding
+NUM_DEVICES = 4 # Set to 1 to disable sharding
 
 def get_sharding():
     """Create sharding specs for seed-parallel training.
@@ -415,7 +415,7 @@ def make_train(config, env):
         }
     return init_env, train
 
-def run_ippo(config, logger):
+def run_ippo(config, logger, time_limit_seconds=None):
     algorithm_config = dict(config.algorithm)
     env = make_env(algorithm_config["ENV_NAME"], algorithm_config["ENV_KWARGS"])
     env = LogWrapper(env)
@@ -428,13 +428,15 @@ def run_ippo(config, logger):
 
     # Toggle modes
     PROFILE_MODE = False  # Set to True for warmup + profiling, False for simple run
-    SHARDED_MODE = False  # Set to True to shard seeds across GPUs
+    SHARDED_MODE = True  # Set to True to shard seeds across GPUs
 
     # Separate init_env from train to make them visible in profiler
     init_env_fn, train_fn = make_train(algorithm_config, env)
 
     # Split rngs for init and train
     init_rngs, train_rngs = jax.vmap(lambda r: jax.random.split(r))(rngs).transpose((1, 0, 2))
+
+    curve = []  # List of (wall_seconds, mean_return) for sweep mode
 
     if PROFILE_MODE:
         # Sharded profiling: shard seeds across devices
@@ -491,8 +493,10 @@ def run_ippo(config, logger):
         train_jit = jax.jit(jax.vmap(train_fn),
                             in_shardings=(data_sharding, data_sharding, data_sharding),
                             out_shardings=data_sharding)
+        
         def train_continue(rng, init_obsv, init_env_state, update_runner_state):
             return train_fn(rng, init_obsv, init_env_state, initial=False, update_runner_state=update_runner_state)
+        
         train_continue_jit = jax.jit(jax.vmap(train_continue),
                                      in_shardings=(data_sharding, data_sharding, data_sharding, data_sharding),
                                      out_shardings=data_sharding)
@@ -506,7 +510,8 @@ def run_ippo(config, logger):
         steps_per_chunk = algorithm_config["TOTAL_TIMESTEPS"] // algorithm_config["TRAIN_CHUNKS"]
         num_updates_per_chunk = steps_per_chunk // algorithm_config["ROLLOUT_LENGTH"] // algorithm_config["NUM_ENVS"]
 
-        for iteration in tqdm(range(algorithm_config["TRAIN_CHUNKS"]), desc="Training Progress"):
+        pbar = tqdm(range(algorithm_config["TRAIN_CHUNKS"]), desc="Training Progress")
+        for iteration in pbar:
             if iteration == 0:
                 init_obsv, init_env_state = init_env_jit(init_rngs)
                 out = train_jit(train_rngs, init_obsv, init_env_state)
@@ -519,6 +524,20 @@ def run_ippo(config, logger):
                 train_rngs = jax.device_put(train_rngs, data_sharding)
                 out = train_continue_jit(train_rngs, init_obsv, init_env_state, update_runner_state)
                 jax.tree.map(lambda x: x.block_until_ready(), out)
+
+            # Display mean episode return on tqdm bar
+            elapsed = time.time() - st
+            ep_returns = np.array(out["metrics"]["returned_episode_returns"])
+            ep_done = np.array(out["metrics"]["returned_episode"])
+            if ep_done.sum() > 0:
+                mean_return = float(ep_returns[ep_done > 0].mean())
+                pbar.set_postfix({"mean_return": f"{mean_return:.2f}"})
+                curve.append((elapsed, mean_return))
+
+            # Check time limit
+            if time_limit_seconds is not None and elapsed >= time_limit_seconds:
+                print(f"\nTime limit ({time_limit_seconds}s) reached at chunk {iteration+1}")
+                break
 
             # Log this chunk's metrics to wandb immediately, then free them
             step_offset = iteration * num_updates_per_chunk
@@ -537,7 +556,8 @@ def run_ippo(config, logger):
         steps_per_chunk = algorithm_config["TOTAL_TIMESTEPS"] // algorithm_config["TRAIN_CHUNKS"]
         num_updates_per_chunk = steps_per_chunk // algorithm_config["ROLLOUT_LENGTH"] // algorithm_config["NUM_ENVS"]
 
-        for iteration in tqdm(range(algorithm_config["TRAIN_CHUNKS"]), desc="Training Progress"):
+        pbar = tqdm(range(algorithm_config["TRAIN_CHUNKS"]), desc="Training Progress")
+        for iteration in pbar:
             if iteration == 0:
                 init_obsv, init_env_state = init_env_jit(init_rngs)
                 out = train_jit(train_rngs, init_obsv, init_env_state)
@@ -549,14 +569,30 @@ def run_ippo(config, logger):
                 out = train_continue_jit(train_rngs, init_obsv, init_env_state, update_runner_state=update_runner_state)
                 jax.tree.map(lambda x: x.block_until_ready(), out)
 
+            # Display mean episode return on tqdm bar
+            elapsed = time.time() - st
+            ep_returns = np.array(out["metrics"]["returned_episode_returns"])
+            ep_done = np.array(out["metrics"]["returned_episode"])
+            if ep_done.sum() > 0:
+                mean_return = float(ep_returns[ep_done > 0].mean())
+                pbar.set_postfix({"mean_return": f"{mean_return:.2f}"})
+                curve.append((elapsed, mean_return))
+
+            # Check time limit
+            if time_limit_seconds is not None and elapsed >= time_limit_seconds:
+                print(f"\nTime limit ({time_limit_seconds}s) reached at chunk {iteration+1}")
+                break
+
             # Log this chunk's metrics to wandb immediately, then free them
             step_offset = iteration * num_updates_per_chunk
             log_metrics_to_wandb(config, out["metrics"], logger, step_offset=step_offset)
 
         print(f"Total training time (s): {time.time() - st:.2f}")
 
-    logger.commit()
-    save_artifacts(config, out, logger)
+    out["curve"] = curve
+    if time_limit_seconds is None:
+        logger.commit()
+        save_artifacts(config, out, logger)
     return out
 
 def log_metrics_to_wandb(config, train_metrics, logger, step_offset=0):
