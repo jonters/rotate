@@ -131,7 +131,7 @@ def main(config):
 
     # --- Sweep mode ---
     sweep_vals = config.get("sweep_num_envs", None)
-    if sweep_vals is not None:
+    if sweep_vals:
         sweep_num_envs(config)
         return
 

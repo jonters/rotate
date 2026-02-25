@@ -99,7 +99,7 @@ def make_train(config, env):
             if config["ANNEAL_LR"]:
                 tx = optax.chain(
                     optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                    optax.adam(learning_rate=cosine_schedule, eps=1e-5),
+                    optax.adam(learning_rate=linear_schedule, eps=1e-5),
                 )
             else:
                 tx = optax.chain(
@@ -278,7 +278,7 @@ def make_train(config, env):
                             value_losses = jnp.square(value - targets)
                             value_losses_clipped = jnp.square(value_pred_clipped - targets)
                             value_loss = (
-                                jnp.maximum(value_losses, value_losses_clipped).mean()
+                                0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                             )
 
                         # CALCULATE ACTOR LOSS
@@ -422,7 +422,8 @@ def run_ippo(config, logger, time_limit_seconds=None):
 
     rng = jax.random.PRNGKey(algorithm_config["TRAIN_SEED"])
     rngs = jax.random.split(rng, algorithm_config["NUM_SEEDS"])
-    
+
+
     import time
     import os
 
@@ -634,3 +635,8 @@ def save_artifacts(config, out, logger):
     # # Log plots to wandb
     # for stat_name, fig in figures.items():
     #     logger.log({f"train_metrics/{stat_name}": fig})
+
+# Time limit (3600s) reached at chunk 2199
+# Training Progress:  11%|███████████████████▌                                                                                                                                                              | 2198/20000 [1:00:00<8:06:04,  1.64s/it, mean_return=20.00]
+# Total training time (s): 3600.94
+#   NUM_ENVS=128: collected 2199 data points
