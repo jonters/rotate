@@ -74,6 +74,7 @@ def initialize_mlp_agent(config, env, rng):
         action_dim=env.action_space(env.agents[0]).n,
         obs_dim=env.observation_space(env.agents[0]).shape[0],
         activation=config.get("ACTIVATION", "tanh"),
+        fc_hidden_dim=config.get("FC_HIDDEN_DIM", 64),
     ) 
     rng, init_rng = jax.random.split(rng)
     init_params = policy.init_params(init_rng)

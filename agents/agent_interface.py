@@ -90,16 +90,17 @@ class AgentPolicy(abc.ABC):
 class MLPActorCriticPolicy(AgentPolicy):
     """Policy wrapper for MLP Actor-Critic"""
     
-    def __init__(self, action_dim, obs_dim, activation="tanh"):
+    def __init__(self, action_dim, obs_dim, activation="tanh", fc_hidden_dim=64):
         """
         Args:
             action_dim: int, dimension of the action space
             obs_dim: int, dimension of the observation space
             activation: str, activation function to use
+            fc_hidden_dim: int, hidden layer dimension for the MLP
         """
         super().__init__(action_dim, obs_dim)
         # self.activation = activation
-        self.network = ActorCritic(action_dim, activation=activation)
+        self.network = ActorCritic(action_dim, activation=activation, fc_hidden_dim=fc_hidden_dim)
     
     @partial(jax.jit, static_argnums=(0,))
     def get_action(self, params, obs, done, avail_actions, hstate, rng, 

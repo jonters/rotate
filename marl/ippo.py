@@ -278,7 +278,7 @@ def make_train(config, env):
                             value_losses = jnp.square(value - targets)
                             value_losses_clipped = jnp.square(value_pred_clipped - targets)
                             value_loss = (
-                                0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+                                jnp.maximum(value_losses, value_losses_clipped).mean()
                             )
 
                         # CALCULATE ACTOR LOSS

@@ -10,7 +10,7 @@ import jax.numpy as jnp
 class ActorCritic(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
-    fc_hidden_dim: int = 64
+    fc_hidden_dim: int = 512
 
     @nn.compact
     def __call__(self, x):
@@ -55,7 +55,7 @@ class ActorCritic(nn.Module):
 class ActorWithDoubleCritic(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
-    fc_hidden_dim: int = 64
+    fc_hidden_dim: int = 512
 
     @nn.compact
     def __call__(self, x):
@@ -112,7 +112,7 @@ class ActorWithDoubleCritic(nn.Module):
 class ActorWithConditionalCritic(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
-    fc_hidden_dim: int = 64
+    fc_hidden_dim: int = 512
 
     @nn.compact
     def __call__(self, x):

@@ -3,11 +3,48 @@
 global_heldout_settings:
   EVAL_SEED: 34957
   MAX_EPISODE_STEPS: ${task.ROLLOUT_LENGTH}
-  NUM_EVAL_EPISODES: 64
+  NUM_EVAL_EPISODES: 1024
   AGGREGATE_STAT: mean # choices: mean, iqm. both are computed with the bootstrapped CI using rliable.
   NORMALIZE_RETURNS: true # if true, use performance bounds to normalize returns
 
 heldout_set:
+  lbf-fov-3:
+    seq_agent_lexi:
+      actor_type: seq_agent
+      ordering_strategy: lexicographic
+      performance_bounds:
+        percent_eaten: [0.0, 100.0]
+        returned_episode_returns: [0.0, 0.5]
+    seq_agent_rlexi:
+      actor_type: seq_agent
+      ordering_strategy: reverse_lexicographic
+      performance_bounds:
+        percent_eaten: [0.0, 100.0]
+        returned_episode_returns: [0.0, 0.5]
+    seq_agent_col:
+      actor_type: seq_agent
+      ordering_strategy: column_major
+      performance_bounds:
+        percent_eaten: [0.0, 100.0]
+        returned_episode_returns: [0.0, 0.5]
+    seq_agent_rcol:
+      actor_type: seq_agent
+      ordering_strategy: reverse_column_major
+      performance_bounds:
+        percent_eaten: [0.0, 100.0]
+        returned_episode_returns: [0.0, 0.5]
+    seq_agent_nearest:
+      actor_type: seq_agent
+      ordering_strategy: nearest_agent
+      performance_bounds:
+        percent_eaten: [0.0, 100.0]
+        returned_episode_returns: [0.0, 0.5]
+    seq_agent_farthest:
+      actor_type: seq_agent
+      ordering_strategy: farthest_agent
+      performance_bounds:
+        percent_eaten: [0.0, 100.0]
+        returned_episode_returns: [0.0, 0.5]
   lbf: # DONE - DO NOT MODIFY. In LBF, results are much better with test mode = false.
     ippo_mlp: 
       path: "eval_teammates/lbf/ippo/2025-04-21_23-41-17/saved_train_run"
