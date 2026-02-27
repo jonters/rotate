@@ -57,10 +57,14 @@ class LogWrapper(JaxMARLWrapper):
                 key, state.env_state, action, unwrapped_reset_state, reset_idx, reset_states_length
             )
         else:
-            obs, env_state, reward, done, info = self._env.step(
+            result = self._env.step(
                 key, state.env_state, action
             )
-            new_reset_idx = None
+            if isinstance(result, tuple) and len(result) == 6:
+                obs, env_state, reward, done, info, new_reset_idx = result
+            else:
+                obs, env_state, reward, done, info = result
+                new_reset_idx = None
         ep_done = done["__all__"]
         new_episode_return = state.episode_returns + self._batchify_floats(reward)
         new_episode_length = state.episode_lengths + 1
@@ -81,14 +85,16 @@ class LogWrapper(JaxMARLWrapper):
         info["returned_episode"] = jnp.full((self._env.num_agents,), ep_done)
 
         # for compatibility with auto-resetting wrapped envs
+        # Only reset the running counters (episode_returns, episode_lengths),
+        # but preserve returned_episode_returns/lengths so they can be read on the next step.
         state = jax.tree.map(
             lambda x, y: jax.lax.select(ep_done, x, y), 
             LogEnvState(
                 env_state,
                 jnp.zeros((self._env.num_agents,)),
                 jnp.zeros((self._env.num_agents,)),
-                jnp.zeros((self._env.num_agents,)),
-                jnp.zeros((self._env.num_agents,)),
+                state.returned_episode_returns,
+                state.returned_episode_lengths,
             ), 
             state)
 
