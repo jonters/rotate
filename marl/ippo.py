@@ -48,17 +48,17 @@ def get_sharding():
     return data_sharding
 
 
-def initialize_agent(actor_type, algorithm_config, env, init_rng):
+def initialize_agent(actor_type, config, env, init_rng):
     if actor_type == "s5":
-        policy, init_params = initialize_s5_agent(algorithm_config, env, init_rng)
+        policy, init_params = initialize_s5_agent(config, env, init_rng)
     elif actor_type == "mlp":
-        policy, init_params = initialize_mlp_agent(algorithm_config, env, init_rng)
+        policy, init_params = initialize_mlp_agent(config, env, init_rng)
     elif actor_type == "rnn":
-        policy, init_params = initialize_rnn_agent(algorithm_config, env, init_rng)
+        policy, init_params = initialize_rnn_agent(config, env, init_rng)
     elif actor_type == "pseudo_actor_with_double_critic":
-        policy, init_params = initialize_pseudo_actor_with_double_critic(algorithm_config, env, init_rng)
+        policy, init_params = initialize_pseudo_actor_with_double_critic(config, env, init_rng)
     elif actor_type == "pseudo_actor_with_conditional_critic":
-        policy, init_params = initialize_pseudo_actor_with_conditional_critic(algorithm_config, env, init_rng)
+        policy, init_params = initialize_pseudo_actor_with_conditional_critic(config, env, init_rng)
     return policy, init_params
 
 def make_train(config, env):
@@ -135,22 +135,18 @@ def make_train(config, env):
             runner_state = (train_state, env_state_inner, last_obs, last_done, last_hstate, reset_idx, rng)
 
             def _env_step(runner_state, unused):
-              with jax.named_scope("env_step"):
                 train_state, env_state, last_obs, last_done, last_hstate, reset_idx, rng = runner_state
 
                 rng, act_rng = jax.random.split(rng)
 
-                with jax.named_scope("batchify_obs"):
-                    last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
-                    last_done_batch = batchify(last_done, env.agents, config["NUM_ACTORS"])
+                last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+                last_done_batch = batchify(last_done, env.agents, config["NUM_ACTORS"])
 
-                with jax.named_scope("get_avail_actions"):
-                    avail_actions = jax.vmap(env.get_avail_actions)(env_state.env_state)
-                    avail_actions = jax.lax.stop_gradient(batchify(avail_actions, 
-                        env.agents, config["NUM_ACTORS"]).astype(jnp.float32))
+                avail_actions = jax.vmap(env.get_avail_actions)(env_state.env_state)
+                avail_actions = jax.lax.stop_gradient(batchify(avail_actions, 
+                    env.agents, config["NUM_ACTORS"]).astype(jnp.float32))
 
-                with jax.named_scope("policy_forward"):
-                    action, value, pi, new_hstate = policy.get_action_value_policy(
+                action, value, pi, new_hstate = policy.get_action_value_policy(
                     params=train_state.params,
                     obs=last_obs_batch.reshape(1, config["NUM_ACTORS"], -1),
                     done=last_done_batch.reshape(1, config["NUM_ACTORS"]),
@@ -158,45 +154,42 @@ def make_train(config, env):
                     hstate=last_hstate,
                     rng=act_rng
                 )
-                    log_prob = pi.log_prob(action)
+                log_prob = pi.log_prob(action)
 
                 action = action.squeeze()
                 log_prob = log_prob.squeeze()
                 value = value.squeeze()
 
-                with jax.named_scope("unbatchify_actions"):
-                    env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
-                    env_act = {k:v.flatten() for k,v in env_act.items()}
+                env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
+                env_act = {k:v.flatten() for k,v in env_act.items()}
 
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
 
-                with jax.named_scope("env_step_call"):
-                    if USE_RESET_BUFFER:
-                        # Use precomputed reset buffer
-                        new_obs, new_env_state, reward, new_done, info, new_reset_idx = jax.vmap(
-                            env.step, in_axes=(0, 0, 0, 0, 0, None)
-                        )(rng_step, env_state, env_act, reset_buffer, reset_idx, NUM_RESETS)
-                    else:
-                        # Original behavior: pass None, reset computed on-the-fly
-                        new_obs, new_env_state, reward, new_done, info, new_reset_idx = jax.vmap(
-                            env.step, in_axes=(0, 0, 0, None, None, None)
-                        )(rng_step, env_state, env_act, None, None, None)
+                if USE_RESET_BUFFER:
+                    # Use precomputed reset buffer
+                    new_obs, new_env_state, reward, new_done, info, new_reset_idx = jax.vmap(
+                        env.step, in_axes=(0, 0, 0, 0, 0, None)
+                    )(rng_step, env_state, env_act, reset_buffer, reset_idx, NUM_RESETS)
+                else:
+                    # Original behavior: pass None, reset computed on-the-fly
+                    new_obs, new_env_state, reward, new_done, info, new_reset_idx = jax.vmap(
+                        env.step, in_axes=(0, 0, 0, None, None, None)
+                    )(rng_step, env_state, env_act, None, None, None)
                 
                 # note that num_actors = num_envs * num_agents
-                with jax.named_scope("build_transition"):
-                    info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
 
-                    transition = Transition(
-                        batchify(new_done, env.agents, config["NUM_ACTORS"]).squeeze(),
-                        action,
-                        value,
-                        batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
-                        log_prob,
-                        last_obs_batch,
-                        info,
-                        avail_actions
-                    )
+                transition = Transition(
+                    batchify(new_done, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    action,
+                    value,
+                    batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    log_prob,
+                    last_obs_batch,
+                    info,
+                    avail_actions
+                )
                 runner_state = (train_state, new_env_state, new_obs, new_done, new_hstate, new_reset_idx, rng)
                 return runner_state, transition
             
@@ -225,7 +218,6 @@ def make_train(config, env):
             last_val = last_val.squeeze()
 
             def _calculate_gae(traj_batch, last_val):
-              with jax.named_scope("calculate_gae"):
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
                     done, value, reward = (
@@ -252,15 +244,11 @@ def make_train(config, env):
             advantages, targets = _calculate_gae(traj_batch, last_val)
 
             def _update_epoch(update_state, unused):
-              with jax.named_scope("update_epoch"):
                 def _update_minbatch(train_state, batch_info):
-                  with jax.named_scope("update_minibatch"):
                     init_hstate, traj_batch, advantages, targets = batch_info
                     def _loss_fn(params, traj_batch, gae, targets):
-                      with jax.named_scope("loss_fn"):
                         # RERUN NETWORK
-                        with jax.named_scope("policy_forward_loss"):
-                            _, value, pi, _ = policy.get_action_value_policy(
+                        _, value, pi, _ = policy.get_action_value_policy(
                             params=params,
                             obs=traj_batch.obs,
                             done=traj_batch.done,
@@ -268,35 +256,33 @@ def make_train(config, env):
                             hstate=init_hstate,
                             rng=jax.random.PRNGKey(0) # only used for action sampling, which is unused here
                         )
-                            log_prob = pi.log_prob(traj_batch.action)
+                        log_prob = pi.log_prob(traj_batch.action)
 
                         # CALCULATE VALUE LOSS
-                        with jax.named_scope("value_loss"):
-                            value_pred_clipped = traj_batch.value + (
-                                value - traj_batch.value
-                            ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                            value_losses = jnp.square(value - targets)
-                            value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                            value_loss = (
-                                jnp.maximum(value_losses, value_losses_clipped).mean()
-                            )
+                        value_pred_clipped = traj_batch.value + (
+                            value - traj_batch.value
+                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+                        value_losses = jnp.square(value - targets)
+                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
+                        value_loss = (
+                            jnp.maximum(value_losses, value_losses_clipped).mean()
+                        )
 
                         # CALCULATE ACTOR LOSS
-                        with jax.named_scope("actor_loss"):
-                            ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-                            loss_actor1 = ratio * gae
-                            loss_actor2 = (
-                                jnp.clip(
-                                    ratio,
-                                    1.0 - config["CLIP_EPS"],
-                                    1.0 + config["CLIP_EPS"],
-                                )
-                                * gae
+                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        loss_actor1 = ratio * gae
+                        loss_actor2 = (
+                            jnp.clip(
+                                ratio,
+                                1.0 - config["CLIP_EPS"],
+                                1.0 + config["CLIP_EPS"],
                             )
-                            loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                            loss_actor = loss_actor.mean()
-                            entropy = pi.entropy().mean()
+                            * gae
+                        )
+                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
+                        loss_actor = loss_actor.mean()
+                        entropy = pi.entropy().mean()
 
                         total_loss = (
                             loss_actor
@@ -305,12 +291,11 @@ def make_train(config, env):
                         )
                         return total_loss, (value_loss, loss_actor, entropy)
 
-                    with jax.named_scope("gradient_update"):
-                        grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                        total_loss, grads = grad_fn(
-                            train_state.params, traj_batch, advantages, targets
-                        )
-                        train_state = train_state.apply_gradients(grads=grads)
+                    grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+                    total_loss, grads = grad_fn(
+                        train_state.params, traj_batch, advantages, targets
+                    )
+                    train_state = train_state.apply_gradients(grads=grads)
                     return train_state, total_loss
 
                 train_state, init_hstate, traj_batch, advantages, targets, rng = update_state
