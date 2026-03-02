@@ -16,7 +16,30 @@ from envs import make_env
 from envs.log_wrapper import LogWrapper
 from marl.ppo_utils import Transition, batchify, unbatchify, _create_minibatches
 
+from jax.sharding import Mesh, PartitionSpec as PS, NamedSharding
 
+# Number of GPUs to shard across (set to 1 to disable sharding)
+NUM_DEVICES = 4 # Set to 1 to disable sharding
+
+# TODO: sharding -- how do we aggregate metrics
+# TODO: how to ctrl-c?
+
+def get_sharding():
+    """
+    Create sharding specs for seed-parallel training.
+    Each seed runs entirely independently on one device.
+    """
+    devices = NUM_DEVICES
+    print(f"Number of devices to use: {devices}")
+
+    # Select subset of devices if NUM_DEVICES < total available
+    all_devices = jax.devices()
+    selected_devices = all_devices[:devices]
+    
+    device_mesh = Mesh(np.array(selected_devices).reshape((devices,)), axis_names=["data"])
+    data_sharding = NamedSharding(device_mesh, PS("data")) # shard seeds across devices
+
+    return data_sharding
 
 def initialize_agent(actor_type, config, env, init_rng):
     if actor_type == "s5":
@@ -43,11 +66,22 @@ def make_train(config):
 
     env = LogWrapper(env)
 
+    # Accumulator for multi-seed io_callback logging.
+    # Under vmap (ordered=True), the callback fires once per seed sequentially.
+    # We buffer each seed's value and log the mean once all NUM_SEEDS have reported.
+    _metric_buffer = {"returns": []}
+
     def linear_schedule(count):
         frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
         return config["LR"] * frac
 
-    def train(rng):
+    def init_env(rng):
+        """Initialize environment state - kept separate from train for sharding."""
+        reset_rng = jax.random.split(rng, config["NUM_ENVS"])
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+        return obsv, env_state
+
+    def train(rng, init_obsv, init_env_state):
 
         # INIT AGENT
         rng, init_rng = jax.random.split(rng)
@@ -70,10 +104,8 @@ def make_train(config):
             tx=tx,
         )
 
-        # INIT ENV
-        rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0))(reset_rng)
+        # Use pre-initialized env state
+        obsv, env_state = init_obsv, init_env_state
 
         # TRAIN LOOP
         def _update_step(update_runner_state, unused):
@@ -270,14 +302,14 @@ def make_train(config):
             rng = update_state[-1]
 
             def callback(metric):
-                wandb.log(
-                    {
-                        "returns": metric["returned_episode_returns"][-1, :].mean(),
-                        "env_step": metric["update_steps"]
-                        * config["NUM_ENVS"]
-                        * config["NUM_STEPS"],
-                    }
-                )
+                ret = float(metric["returned_episode_returns"][-1, :].mean())
+                _metric_buffer["returns"].append(ret)
+                if len(_metric_buffer["returns"]) == config["NUM_SEEDS"]:
+                    mean_return = np.mean(_metric_buffer["returns"])
+                    env_step = int(metric["update_steps"]) * config["NUM_ENVS"] * config["NUM_STEPS"]
+                    wandb.log({"returns": mean_return, "env_step": env_step})
+                    _metric_buffer["returns"] = []
+
             metric["update_steps"] = update_steps
             jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
@@ -294,13 +326,14 @@ def make_train(config):
         )
         return {"runner_state": runner_state}
 
-    return train
+    return init_env, train
 
 def main():
     config = {
         "LR": 5e-4,
         "NUM_ENVS": 1024,
         "NUM_STEPS": 128,
+        "NUM_SEEDS": 4,
         "TOTAL_TIMESTEPS": int(2e9),
         "UPDATE_EPOCHS": 4,
         "NUM_MINIBATCHES": 4,
@@ -340,13 +373,39 @@ def main():
         mode=config["WANDB_MODE"],
     )
 
+    data_sharding = get_sharding()
+
+    assert config["NUM_SEEDS"] % NUM_DEVICES == 0, "NUM_SEEDS must be divisible by NUM_DEVICES for sharding"
 
     rng = jax.random.PRNGKey(67)
-    train_jit = jax.jit(make_train(config), device=jax.devices()[0])
+    rngs = jax.random.split(rng, config["NUM_SEEDS"])
+
+    init_env_fn, train_fn = make_train(config)
+
+    # Split each seed's rng into an init_rng and a train_rng
+    init_rngs, train_rngs = jax.vmap(lambda r: jax.random.split(r))(rngs).transpose((1, 0, 2))
+
+    # JIT-compile with vmap over seeds, sharded across devices
+    init_env_jit = jax.jit(jax.vmap(init_env_fn),
+                           in_shardings=data_sharding,
+                           out_shardings=data_sharding)
+    train_jit = jax.jit(jax.vmap(train_fn),
+                        in_shardings=(data_sharding, data_sharding, data_sharding),
+                        out_shardings=data_sharding)
+
+    # Place seed rngs on devices
+    init_rngs = jax.device_put(init_rngs, data_sharding)
+    train_rngs = jax.device_put(train_rngs, data_sharding)
+
     print("starting training...")
     import time
     st = time.time()
-    out = train_jit(rng)
+
+    # Initialize envs, then train — both sharded across devices
+    init_obsv, init_env_state = init_env_jit(init_rngs)
+    out = train_jit(train_rngs, init_obsv, init_env_state)
+    jax.tree.map(lambda x: x.block_until_ready(), out)
+
     print("training time:", time.time() - st)
     # results = out["returned_episode_returns"].mean(-1).reshape(-1)
     # jnp.save('hanabi_results', results)
