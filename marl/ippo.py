@@ -63,20 +63,18 @@ def initialize_agent(actor_type, config, env, init_rng):
 
 def make_train(config, env):
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
-    config["STEPS_PER_CHUNK"] = config["TOTAL_TIMESTEPS"] // config["TRAIN_CHUNKS"]
-    config["NUM_UPDATES"] = (
-        config["STEPS_PER_CHUNK"] // config["ROLLOUT_LENGTH"] // config["NUM_ENVS"]
-    )
+    config["TOTAL_NUM_UPDATES"] = config["TOTAL_TIMESTEPS"] // config["ROLLOUT_LENGTH"] // config["NUM_ENVS"]
+    config["NUM_UPDATES"] = config["TOTAL_NUM_UPDATES"] // config["TRAIN_CHUNKS"]
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["ROLLOUT_LENGTH"] // config["NUM_MINIBATCHES"]
     )
 
     def linear_schedule(count):
-        frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / (config["NUM_UPDATES"] * config["TRAIN_CHUNKS"])
+        frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["TOTAL_NUM_UPDATES"]
         return config["LR"] * frac
 
     def cosine_schedule(count):
-        progress = (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / (config["NUM_UPDATES"] * config["TRAIN_CHUNKS"])
+        progress = (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["TOTAL_NUM_UPDATES"]
         frac = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
         return config["LR"] * frac
 
@@ -89,7 +87,7 @@ def make_train(config, env):
     def train(rng, init_obsv, init_env_state, initial=True, update_runner_state=None):
 
         # Toggle between precomputed reset buffer vs on-the-fly reset
-        USE_RESET_BUFFER = True  # Set to False for original behavior (reset computed each step)
+        USE_RESET_BUFFER = False  # Set to False for original behavior (reset computed each step)
         NUM_RESETS = config.get("NUM_RESETS", 20)  # buffer size (only used if USE_RESET_BUFFER=True)
 
         rng, init_rng = jax.random.split(rng)
@@ -493,8 +491,7 @@ def run_ippo(config, logger, time_limit_seconds=None):
         st = time.time()
         from tqdm import tqdm
 
-        steps_per_chunk = algorithm_config["TOTAL_TIMESTEPS"] // algorithm_config["TRAIN_CHUNKS"]
-        num_updates_per_chunk = steps_per_chunk // algorithm_config["ROLLOUT_LENGTH"] // algorithm_config["NUM_ENVS"]
+        num_updates_per_chunk = algorithm_config["NUM_UPDATES"]
 
         pbar = tqdm(range(algorithm_config["TRAIN_CHUNKS"]), desc="Training Progress")
         for iteration in pbar:
@@ -539,8 +536,7 @@ def run_ippo(config, logger, time_limit_seconds=None):
         st = time.time()
         from tqdm import tqdm
 
-        steps_per_chunk = algorithm_config["TOTAL_TIMESTEPS"] // algorithm_config["TRAIN_CHUNKS"]
-        num_updates_per_chunk = steps_per_chunk // algorithm_config["ROLLOUT_LENGTH"] // algorithm_config["NUM_ENVS"]
+        num_updates_per_chunk = algorithm_config["NUM_UPDATES"]
 
         pbar = tqdm(range(algorithm_config["TRAIN_CHUNKS"]), desc="Training Progress")
         for iteration in pbar:
