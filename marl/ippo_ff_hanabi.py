@@ -302,13 +302,21 @@ def make_train(config):
             rng = update_state[-1]
 
             def callback(metric):
-                ret = float(metric["returned_episode_returns"][-1, :].mean())
-                _metric_buffer["returns"].append(ret)
-                if len(_metric_buffer["returns"]) == config["NUM_SEEDS"]:
-                    mean_return = np.mean(_metric_buffer["returns"])
-                    env_step = int(metric["update_steps"]) * config["NUM_ENVS"] * config["NUM_STEPS"]
-                    wandb.log({"returns": mean_return, "env_step": env_step})
-                    _metric_buffer["returns"] = []
+                wandb.log(
+                    {
+                        "returns": metric["returned_episode_returns"][-1, :].mean(),
+                        "env_step": metric["update_steps"]
+                        * config["NUM_ENVS"]
+                        * config["NUM_STEPS"],
+                    }
+                )
+                # ret = float(metric["returned_episode_returns"][-1, :].mean())
+                # _metric_buffer["returns"].append(ret)
+                # if len(_metric_buffer["returns"]) == config["NUM_SEEDS"]:
+                #     mean_return = np.mean(_metric_buffer["returns"])
+                #     env_step = int(metric["update_steps"]) * config["NUM_ENVS"] * config["NUM_STEPS"]
+                #     wandb.log({"returns": mean_return, "env_step": env_step})
+                #     _metric_buffer["returns"] = []
 
             metric["update_steps"] = update_steps
             jax.experimental.io_callback(callback, None, metric)
@@ -330,7 +338,7 @@ def make_train(config):
 
 def main():
     config = {
-        "LR": 5e-4,
+        "LR": 0.0001,
         "NUM_ENVS": 1024,
         "NUM_STEPS": 128,
         "NUM_SEEDS": 4,
@@ -346,7 +354,7 @@ def main():
         "ENV_NAME": "hanabi",
         "ENV_KWARGS": {},
         "ANNEAL_LR": False,
-        "ACTOR_TYPE": "mlp", # mlp
+        "ACTOR_TYPE": "s5", # mlp
         "ACTIVATION": "relu",
         "FC_HIDDEN_DIM": 512,
         # S5-specific hyperparameters (used when ACTOR_TYPE is "s5")
