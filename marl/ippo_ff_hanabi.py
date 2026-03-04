@@ -58,11 +58,11 @@ def make_train(config):
     env = make_env(config["ENV_NAME"], config["ENV_KWARGS"])
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["TOTAL_NUM_UPDATES"] = (
-            config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
+            config["TOTAL_TIMESTEPS"] // config["ROLLOUT_LENGTH"] // config["NUM_ENVS"]
     )
     config["NUM_UPDATES"] = config["TOTAL_NUM_UPDATES"] // config.get("TRAIN_CHUNKS", 1)
     config["MINIBATCH_SIZE"] = (
-            config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
+            config["NUM_ACTORS"] * config["ROLLOUT_LENGTH"] // config["NUM_MINIBATCHES"]
     )
 
     env = LogWrapper(env)
@@ -180,7 +180,7 @@ def make_train(config):
                 return runner_state, transition
             
             runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
+                _env_step, runner_state, None, config["ROLLOUT_LENGTH"]
             )
 
             # Get final value estimate for completed trajectory
@@ -309,14 +309,14 @@ def make_train(config):
                         "returns": metric["returned_episode_returns"][-1, :].mean(),
                         "env_step": metric["update_steps"]
                         * config["NUM_ENVS"]
-                        * config["NUM_STEPS"],
+                        * config["ROLLOUT_LENGTH"],
                     }
                 )
                 # ret = float(metric["returned_episode_returns"][-1, :].mean())
                 # _metric_buffer["returns"].append(ret)
                 # if len(_metric_buffer["returns"]) == config["NUM_SEEDS"]:
                 #     mean_return = np.mean(_metric_buffer["returns"])
-                #     env_step = int(metric["update_steps"]) * config["NUM_ENVS"] * config["NUM_STEPS"]
+                #     env_step = int(metric["update_steps"]) * config["NUM_ENVS"] * config["ROLLOUT_LENGTH"]
                 #     wandb.log({"returns": mean_return, "env_step": env_step})
                 #     _metric_buffer["returns"] = []
 
@@ -343,9 +343,9 @@ def make_train(config):
 
 def main():
     config = {
-        "LR": 0.0001,
+        "LR": 0.0005,
         "NUM_ENVS": 1024,
-        "NUM_STEPS": 128,
+        "ROLLOUT_LENGTH": 128,
         "NUM_SEEDS": 4,
         "TOTAL_TIMESTEPS": int(2e9),
         "TRAIN_CHUNKS": 500,  # Set > 1 to chunk training (reduces JIT memory, enables progress tracking)

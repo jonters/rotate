@@ -86,12 +86,13 @@ def make_train(config, env):
 
     def train(rng, init_obsv, init_env_state, initial=True, update_runner_state=None):
 
+        # INIT AGENT
+        rng, init_rng = jax.random.split(rng)
+        policy, init_params = initialize_agent(config["ACTOR_TYPE"], config, env, init_rng)
+
         # Toggle between precomputed reset buffer vs on-the-fly reset
         USE_RESET_BUFFER = False  # Set to False for original behavior (reset computed each step)
         NUM_RESETS = config.get("NUM_RESETS", 20)  # buffer size (only used if USE_RESET_BUFFER=True)
-
-        rng, init_rng = jax.random.split(rng)
-        policy, init_params = initialize_agent(config["ACTOR_TYPE"], config, env, init_rng)
 
         if initial:
             if config["ANNEAL_LR"]:
@@ -100,10 +101,7 @@ def make_train(config, env):
                     optax.adam(learning_rate=linear_schedule, eps=1e-5),
                 )
             else:
-                tx = optax.chain(
-                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), 
-                    optax.adam(config["LR"], eps=1e-5))
-
+                tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["LR"], eps=1e-5))
             train_state = TrainState.create(
                 apply_fn=policy.network.apply,
                 params=init_params,
