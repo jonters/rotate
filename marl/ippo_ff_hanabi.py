@@ -57,9 +57,10 @@ def initialize_agent(actor_type, config, env, init_rng):
 def make_train(config):
     env = make_env(config["ENV_NAME"], config["ENV_KWARGS"])
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
-    config["NUM_UPDATES"] = (
+    config["TOTAL_NUM_UPDATES"] = (
             config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
+    config["NUM_UPDATES"] = config["TOTAL_NUM_UPDATES"] // config.get("TRAIN_CHUNKS", 1)
     config["MINIBATCH_SIZE"] = (
             config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
@@ -72,7 +73,7 @@ def make_train(config):
     _metric_buffer = {"returns": []}
 
     def linear_schedule(count):
-        frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
+        frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["TOTAL_NUM_UPDATES"]
         return config["LR"] * frac
 
     def init_env(rng):
@@ -81,7 +82,7 @@ def make_train(config):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         return obsv, env_state
 
-    def train(rng, init_obsv, init_env_state):
+    def train(rng, init_obsv, init_env_state, initial=True, update_runner_state=None):
 
         # INIT AGENT
         rng, init_rng = jax.random.split(rng)
@@ -91,21 +92,22 @@ def make_train(config):
         USE_RESET_BUFFER = False  # Set to False for original behavior (reset computed each step)
         NUM_RESETS = config.get("NUM_RESETS", 20)  # buffer size (only used if USE_RESET_BUFFER=True)
 
-        if config["ANNEAL_LR"]:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
+        if initial:
+            if config["ANNEAL_LR"]:
+                tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                    optax.adam(learning_rate=linear_schedule, eps=1e-5),
+                )
+            else:
+                tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["LR"], eps=1e-5))
+            train_state = TrainState.create(
+                apply_fn=policy.network.apply,
+                params=init_params,
+                tx=tx,
             )
-        else:
-            tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["LR"], eps=1e-5))
-        train_state = TrainState.create(
-            apply_fn=policy.network.apply,
-            params=init_params,
-            tx=tx,
-        )
 
-        # Use pre-initialized env state
-        obsv, env_state = init_obsv, init_env_state
+            # Use pre-initialized env state
+            obsv, env_state = init_obsv, init_env_state
 
         # TRAIN LOOP
         def _update_step(update_runner_state, unused):
@@ -324,15 +326,18 @@ def make_train(config):
             runner_state = (train_state, env_state, last_obs, last_done, last_hstate, reset_idx, rng)
             return (runner_state, update_steps), None
 
-        rng, _rng = jax.random.split(rng)
-        init_hstate = policy.init_hstate(config["NUM_ACTORS"])
-        init_done = {k: jnp.zeros((config["NUM_ENVS"]), dtype=bool) for k in env.agents + ["__all__"]}
-        init_reset_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
-        runner_state = (train_state, env_state, obsv, init_done, init_hstate, init_reset_idx, _rng)
-        runner_state, _ = jax.lax.scan(
-            _update_step, (runner_state, 0), None, config["NUM_UPDATES"]
+        if initial:
+            rng, _rng = jax.random.split(rng)
+            init_hstate = policy.init_hstate(config["NUM_ACTORS"])
+            init_done = {k: jnp.zeros((config["NUM_ENVS"]), dtype=bool) for k in env.agents + ["__all__"]}
+            init_reset_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
+            runner_state = (train_state, env_state, obsv, init_done, init_hstate, init_reset_idx, _rng)
+            update_runner_state = (runner_state, 0)
+
+        update_runner_state, _ = jax.lax.scan(
+            _update_step, update_runner_state, None, config["NUM_UPDATES"]
         )
-        return {"runner_state": runner_state}
+        return {"update_runner_state": update_runner_state}
 
     return init_env, train
 
@@ -343,6 +348,7 @@ def main():
         "NUM_STEPS": 128,
         "NUM_SEEDS": 4,
         "TOTAL_TIMESTEPS": int(2e9),
+        "TRAIN_CHUNKS": 500,  # Set > 1 to chunk training (reduces JIT memory, enables progress tracking)
         "UPDATE_EPOCHS": 4,
         "NUM_MINIBATCHES": 4,
         "GAMMA": 0.99,
@@ -354,7 +360,7 @@ def main():
         "ENV_NAME": "hanabi",
         "ENV_KWARGS": {},
         "ANNEAL_LR": False,
-        "ACTOR_TYPE": "s5", # mlp
+        "ACTOR_TYPE": "mlp", # mlp
         "ACTIVATION": "relu",
         "FC_HIDDEN_DIM": 512,
         # S5-specific hyperparameters (used when ACTOR_TYPE is "s5")
@@ -401,18 +407,33 @@ def main():
                         in_shardings=(data_sharding, data_sharding, data_sharding),
                         out_shardings=data_sharding)
 
+    def train_continue(rng, init_obsv, init_env_state, update_runner_state):
+        return train_fn(rng, init_obsv, init_env_state, initial=False, update_runner_state=update_runner_state)
+
+    train_continue_jit = jax.jit(jax.vmap(train_continue),
+                                 in_shardings=(data_sharding, data_sharding, data_sharding, data_sharding),
+                                 out_shardings=data_sharding)
+
     # Place seed rngs on devices
     init_rngs = jax.device_put(init_rngs, data_sharding)
     train_rngs = jax.device_put(train_rngs, data_sharding)
 
     print("starting training...")
     import time
+    from tqdm import tqdm
     st = time.time()
 
-    # Initialize envs, then train — both sharded across devices
+    train_chunks = config.get("TRAIN_CHUNKS", 1)
     init_obsv, init_env_state = init_env_jit(init_rngs)
-    out = train_jit(train_rngs, init_obsv, init_env_state)
-    jax.tree.map(lambda x: x.block_until_ready(), out)
+
+    pbar = tqdm(range(train_chunks), desc="Training Progress")
+    for iteration in pbar:
+        if iteration == 0:
+            out = train_jit(train_rngs, init_obsv, init_env_state)
+        else:
+            update_runner_state = out["update_runner_state"]
+            out = train_continue_jit(train_rngs, init_obsv, init_env_state, update_runner_state)
+        jax.tree.map(lambda x: x.block_until_ready(), out)
 
     print("training time:", time.time() - st)
     # results = out["returned_episode_returns"].mean(-1).reshape(-1)
