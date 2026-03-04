@@ -47,7 +47,6 @@ def get_sharding():
 
     return data_sharding
 
-
 def initialize_agent(actor_type, config, env, init_rng):
     if actor_type == "s5":
         policy, init_params = initialize_s5_agent(config, env, init_rng)
@@ -79,7 +78,7 @@ def make_train(config, env):
         return config["LR"] * frac
 
     def init_env(rng):
-        """Initialize environment state - kept separate from train for profiling."""
+        """Initialize environment state - kept separate from train for sharding."""
         reset_rng = jax.random.split(rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         return obsv, env_state
@@ -189,6 +188,7 @@ def make_train(config, env):
                 runner_state = (train_state, new_env_state, new_obs, new_done, new_hstate, new_reset_idx, rng)
                 return runner_state, transition
             
+
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["ROLLOUT_LENGTH"]
             )

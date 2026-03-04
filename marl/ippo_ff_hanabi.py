@@ -7,8 +7,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.training.train_state import TrainState
-import wandb
 import functools
+import time
+from tqdm import tqdm
 
 from agents.initialize_agents import initialize_s5_agent, initialize_mlp_agent, \
     initialize_rnn_agent, initialize_pseudo_actor_with_double_critic, initialize_pseudo_actor_with_conditional_critic
@@ -132,53 +133,62 @@ def make_train(config):
                 train_state, env_state, last_obs, last_done, last_hstate, reset_idx, rng = runner_state
 
                 rng, act_rng = jax.random.split(rng)
+
+                last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+                last_done_batch = batchify(last_done, env.agents, config["NUM_ACTORS"])
+
                 avail_actions = jax.vmap(env.get_avail_actions)(env_state.env_state)
-                avail_actions = jax.lax.stop_gradient(
-                    batchify(avail_actions, env.agents, config["NUM_ACTORS"]).astype(jnp.float32)
-                )
-                obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
-                done_batch = batchify(last_done, env.agents, config["NUM_ACTORS"])
+                avail_actions = jax.lax.stop_gradient(batchify(avail_actions, 
+                    env.agents, config["NUM_ACTORS"]).astype(jnp.float32))
 
                 action, value, pi, new_hstate = policy.get_action_value_policy(
                     params=train_state.params,
-                    obs=obs_batch.reshape(1, config["NUM_ACTORS"], -1),
-                    done=done_batch.reshape(1, config["NUM_ACTORS"]),
+                    obs=last_obs_batch.reshape(1, config["NUM_ACTORS"], -1),
+                    done=last_done_batch.reshape(1, config["NUM_ACTORS"]),
                     avail_actions=avail_actions.reshape(1, config["NUM_ACTORS"], -1),
                     hstate=last_hstate,
                     rng=act_rng
                 )
                 log_prob = pi.log_prob(action)
-                env_act = unbatchify(action.squeeze(), env.agents, config["NUM_ENVS"], env.num_agents)
-                env_act = {k: v.flatten() for k, v in env_act.items()}
 
-                # STEP ENV
+                action = action.squeeze()
+                log_prob = log_prob.squeeze()
+                value = value.squeeze()
+
+                env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
+                env_act = {k:v.flatten() for k,v in env_act.items()}
+
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
 
                 if USE_RESET_BUFFER:
                     # Use precomputed reset buffer
-                    obsv, env_state, reward, done, info, new_reset_idx = jax.vmap(
+                    new_obs, new_env_state, reward, new_done, info, new_reset_idx = jax.vmap(
                         env.step, in_axes=(0, 0, 0, 0, 0, None)
                     )(rng_step, env_state, env_act, reset_buffer, reset_idx, NUM_RESETS)
                 else:
                     # Original behavior: pass None, reset computed on-the-fly
-                    obsv, env_state, reward, done, info, new_reset_idx = jax.vmap(
+                    new_obs, new_env_state, reward, new_done, info, new_reset_idx = jax.vmap(
                         env.step, in_axes=(0, 0, 0, None, None, None)
                     )(rng_step, env_state, env_act, None, None, None)
+                
+                # note that num_actors = num_envs * num_agents
                 info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+
                 transition = Transition(
-                    batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    action.squeeze(),
-                    value.squeeze(),
+                    batchify(new_done, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    action,
+                    value,
                     batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    log_prob.squeeze(),
-                    obs_batch,
+                    log_prob,
+                    last_obs_batch,
                     info,
                     avail_actions
                 )
-                runner_state = (train_state, env_state, obsv, done, new_hstate, new_reset_idx, rng)
+                runner_state = (train_state, new_env_state, new_obs, new_done, new_hstate, new_reset_idx, rng)
                 return runner_state, transition
             
+
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["ROLLOUT_LENGTH"]
             )
@@ -322,7 +332,7 @@ def make_train(config):
 
             metric["update_steps"] = update_steps
             jax.experimental.io_callback(callback, None, metric)
-            update_steps = update_steps + 1
+            update_steps += 1
             runner_state = (train_state, env_state, last_obs, last_done, last_hstate, reset_idx, rng)
             return (runner_state, update_steps), None
 
@@ -335,7 +345,10 @@ def make_train(config):
             update_runner_state = (runner_state, 0)
 
         update_runner_state, _ = jax.lax.scan(
-            _update_step, update_runner_state, None, config["NUM_UPDATES"]
+            _update_step, 
+            update_runner_state, 
+            xs=None,
+            length=config["NUM_UPDATES"],
         )
         return {"update_runner_state": update_runner_state}
 
