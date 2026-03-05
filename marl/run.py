@@ -13,6 +13,7 @@ from omegaconf import OmegaConf
 
 from common.wandb_visualizations import Logger
 from ippo import run_ippo
+from ippo_ff_hanabi import run_ippo_ff_hanabi
 
 
 class NoOpLogger:
@@ -140,6 +141,8 @@ def main(config):
 
     if config.algorithm["ALG"] == "ippo":
         run_ippo(config, wandb_logger)
+    elif config.algorithm["ALG"] == "ippo_ff_hanabi":
+        run_ippo_ff_hanabi(config, wandb_logger)
     else:
         raise NotImplementedError(f"Algorithm {config['ALG']} not implemented.")
         

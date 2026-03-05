@@ -2,10 +2,13 @@
 Based on PureJaxRL Implementation of PPO
 """
 
+import os
+import sys
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import wandb
 from flax.training.train_state import TrainState
 import functools
 import time
@@ -21,9 +24,6 @@ from jax.sharding import Mesh, PartitionSpec as PS, NamedSharding
 
 # Number of GPUs to shard across (set to 1 to disable sharding)
 NUM_DEVICES = 4 # Set to 1 to disable sharding
-
-# TODO: sharding -- how do we aggregate metrics
-# TODO: how to ctrl-c?
 
 def get_sharding():
     """
@@ -316,19 +316,31 @@ def make_train(config):
             def callback(metric):
                 wandb.log(
                     {
-                        "returns": metric["returned_episode_returns"][-1, :].mean(),
+                        "returned_episode_returns": metric["returned_episode_returns"][-1, :].mean(),
                         "env_step": metric["update_steps"]
                         * config["NUM_ENVS"]
                         * config["ROLLOUT_LENGTH"],
                     }
                 )
-                # ret = float(metric["returned_episode_returns"][-1, :].mean())
-                # _metric_buffer["returns"].append(ret)
-                # if len(_metric_buffer["returns"]) == config["NUM_SEEDS"]:
-                #     mean_return = np.mean(_metric_buffer["returns"])
-                #     env_step = int(metric["update_steps"]) * config["NUM_ENVS"] * config["ROLLOUT_LENGTH"]
-                #     wandb.log({"returns": mean_return, "env_step": env_step})
-                #     _metric_buffer["returns"] = []
+
+            # def callback(metric):
+            #     mask = metric["returned_episode"]
+            #     ep_returns = metric["returned_episode_returns"]
+            #     mask_sum = mask.sum()
+            #     mean_return = np.where(mask_sum > 0,
+            #                            np.where(mask, ep_returns, 0).sum() / mask_sum,
+            #                            0.0)
+            #     # Old metric: mean of last timestep (includes stale values)
+            #     old_mean_return = ep_returns[-1, :].mean()
+            #     train_step = int(metric["update_steps"])
+            #     wandb.log(
+            #         {
+            #             "Train/returned_episode_returns": float(mean_return),
+            #             "Train/returned_episode_returns_old": float(old_mean_return),
+            #             "train_step": train_step,
+            #         },
+            #         commit=True,
+            #     )
 
             metric["update_steps"] = update_steps
             jax.experimental.io_callback(callback, None, metric)
@@ -354,63 +366,66 @@ def make_train(config):
 
     return init_env, train
 
-def main():
-    config = {
-        "LR": 0.0005,
-        "NUM_ENVS": 1024,
-        "ROLLOUT_LENGTH": 128,
-        "NUM_SEEDS": 4,
-        "TOTAL_TIMESTEPS": int(2e9),
-        "TRAIN_CHUNKS": 500,  # Set > 1 to chunk training (reduces JIT memory, enables progress tracking)
-        "UPDATE_EPOCHS": 4,
-        "NUM_MINIBATCHES": 4,
-        "GAMMA": 0.99,
-        "GAE_LAMBDA": 0.95,
-        "CLIP_EPS": 0.2,
-        "ENT_COEF": 0.01,
-        "VF_COEF": 0.5,
-        "MAX_GRAD_NORM": 0.5,
-        "ENV_NAME": "hanabi",
-        "ENV_KWARGS": {},
-        "ANNEAL_LR": False,
-        "ACTOR_TYPE": "mlp", # mlp
-        "ACTIVATION": "relu",
-        "FC_HIDDEN_DIM": 512,
-        # S5-specific hyperparameters (used when ACTOR_TYPE is "s5")
-        "S5_D_MODEL": 128,
-        "S5_SSM_SIZE": 128,
-        "S5_N_LAYERS": 2,
-        "S5_BLOCKS": 1,
-        "S5_ACTOR_CRITIC_HIDDEN_DIM": 1024,
-        "FC_N_LAYERS": 3,
-        "S5_ACTIVATION": "full_glu",
-        "S5_DO_NORM": True,
-        "S5_PRENORM": True,
-        "S5_DO_GTRXL_NORM": True,
-        "WANDB_MODE": "online", # options: online, offline, disabled
-        "ENTITY": "",
-        "PROJECT": "",
-    }
+def run_ippo_ff_hanabi(config, logger, time_limit_seconds=None):
+    algorithm_config = dict(config.algorithm)
 
-    wandb.init(
-        entity=config["ENTITY"],
-        project=config["PROJECT"],
-        tags=["IPPO", "FF", config["ENV_NAME"]],
-        config=config,
-        mode=config["WANDB_MODE"],
-    )
+    # print(algorithm_config)
 
-    data_sharding = get_sharding()
+    # algorithm_config = {
+    #     "LR": 0.0005,
+    #     "NUM_ENVS": 1024,
+    #     "ROLLOUT_LENGTH": 128,
+    #     "NUM_SEEDS": 4,
+    #     "TOTAL_TIMESTEPS": int(2e9),
+    #     "TRAIN_CHUNKS": 500,  # Set > 1 to chunk training (reduces JIT memory, enables progress tracking)
+    #     "UPDATE_EPOCHS": 4,
+    #     "NUM_MINIBATCHES": 4,
+    #     "GAMMA": 0.99,
+    #     "GAE_LAMBDA": 0.95,
+    #     "CLIP_EPS": 0.2,
+    #     "ENT_COEF": 0.01,
+    #     "VF_COEF": 0.5,
+    #     "MAX_GRAD_NORM": 0.5,
+    #     "ENV_NAME": "hanabi",
+    #     "ENV_KWARGS": {},
+    #     "ANNEAL_LR": False,
+    #     "ACTOR_TYPE": "mlp", # mlp
+    #     "ACTIVATION": "relu",
+    #     "FC_HIDDEN_DIM": 512,
+    #     # S5-specific hyperparameters (used when ACTOR_TYPE is "s5")
+    #     "S5_D_MODEL": 128,
+    #     "S5_SSM_SIZE": 128,
+    #     "S5_N_LAYERS": 2,
+    #     "S5_BLOCKS": 1,
+    #     "S5_ACTOR_CRITIC_HIDDEN_DIM": 1024,
+    #     "FC_N_LAYERS": 3,
+    #     "S5_ACTIVATION": "full_glu",
+    #     "S5_DO_NORM": True,
+    #     "S5_PRENORM": True,
+    #     "S5_DO_GTRXL_NORM": True,
+    #     "WANDB_MODE": "online", # options: online, offline, disabled
+    #     "ENTITY": "",
+    #     "PROJECT": "",
+    # }
 
-    assert config["NUM_SEEDS"] % NUM_DEVICES == 0, "NUM_SEEDS must be divisible by NUM_DEVICES for sharding"
+    # print(algorithm_config)
+    
+    # exit()
 
-    rng = jax.random.PRNGKey(67)
-    rngs = jax.random.split(rng, config["NUM_SEEDS"])
+    print("Overwrode algorithm config")
 
-    init_env_fn, train_fn = make_train(config)
+    rng = jax.random.PRNGKey(20374)
+    rngs = jax.random.split(rng, algorithm_config["NUM_SEEDS"])
+
+    init_env_fn, train_fn = make_train(algorithm_config)
 
     # Split each seed's rng into an init_rng and a train_rng
     init_rngs, train_rngs = jax.vmap(lambda r: jax.random.split(r))(rngs).transpose((1, 0, 2))
+
+    # Seed-parallel sharding: each seed runs independently on one device
+    data_sharding = get_sharding()
+    assert algorithm_config["NUM_SEEDS"] % NUM_DEVICES == 0, \
+        f"NUM_SEEDS ({algorithm_config['NUM_SEEDS']}) must be divisible by num_devices ({NUM_DEVICES})"
 
     # JIT-compile with vmap over seeds, sharded across devices
     init_env_jit = jax.jit(jax.vmap(init_env_fn),
@@ -432,11 +447,9 @@ def main():
     train_rngs = jax.device_put(train_rngs, data_sharding)
 
     print("starting training...")
-    import time
-    from tqdm import tqdm
     st = time.time()
 
-    train_chunks = config.get("TRAIN_CHUNKS", 1)
+    train_chunks = algorithm_config.get("TRAIN_CHUNKS", 1)
     init_obsv, init_env_state = init_env_jit(init_rngs)
 
     pbar = tqdm(range(train_chunks), desc="Training Progress")
@@ -448,16 +461,27 @@ def main():
             out = train_continue_jit(train_rngs, init_obsv, init_env_state, update_runner_state)
         jax.tree.map(lambda x: x.block_until_ready(), out)
 
-    print("training time:", time.time() - st)
-    # results = out["returned_episode_returns"].mean(-1).reshape(-1)
-    # jnp.save('hanabi_results', results)
-    # plt.plot(results)
-    # plt.xlabel("Update Step")
-    # plt.ylabel("Return")
-    # plt.savefig(f'IPPO_{config["ENV_NAME"]}.png')
+    print(f"Total training time (s): {time.time() - st:.2f}")
+
+    return out
 
 
 if __name__ == "__main__":
-    main()
+    # Allow running directly: python marl/ippo_ff_hanabi.py algorithm=ippo/hanabi task=hanabi
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
 
-    #CUDA_VISIBLE_DEVICES=2 python marl/run.py algorithm=ippo/hanabi task=hanabi
+    import hydra
+    from omegaconf import OmegaConf
+    from common.wandb_visualizations import Logger
+
+    @hydra.main(version_base=None, config_path="configs", config_name="base_config_marl")
+    def main(config):
+        print(OmegaConf.to_yaml(config, resolve=True))
+        wandb_logger = Logger(config)
+        # print(config)
+        run_ippo_ff_hanabi(config, wandb_logger)
+        wandb_logger.close()
+
+    main()

@@ -408,6 +408,10 @@ def run_ippo(config, logger, time_limit_seconds=None):
     import time
     import os
 
+    print(config)
+
+    exit()
+
     # Toggle modes
     PROFILE_MODE = False  # Set to True for warmup + profiling, False for simple run
     SHARDED_MODE = True  # Set to True to shard seeds across GPUs
