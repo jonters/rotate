@@ -323,25 +323,6 @@ def make_train(config):
                     }
                 )
 
-            # def callback(metric):
-            #     mask = metric["returned_episode"]
-            #     ep_returns = metric["returned_episode_returns"]
-            #     mask_sum = mask.sum()
-            #     mean_return = np.where(mask_sum > 0,
-            #                            np.where(mask, ep_returns, 0).sum() / mask_sum,
-            #                            0.0)
-            #     # Old metric: mean of last timestep (includes stale values)
-            #     old_mean_return = ep_returns[-1, :].mean()
-            #     train_step = int(metric["update_steps"])
-            #     wandb.log(
-            #         {
-            #             "Train/returned_episode_returns": float(mean_return),
-            #             "Train/returned_episode_returns_old": float(old_mean_return),
-            #             "train_step": train_step,
-            #         },
-            #         commit=True,
-            #     )
-
             metric["update_steps"] = update_steps
             jax.experimental.io_callback(callback, None, metric)
             update_steps += 1

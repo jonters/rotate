@@ -401,16 +401,12 @@ def run_ippo(config, logger, time_limit_seconds=None):
     env = make_env(algorithm_config["ENV_NAME"], algorithm_config["ENV_KWARGS"])
     env = LogWrapper(env)
 
-    rng = jax.random.PRNGKey(algorithm_config["TRAIN_SEED"])
+    rng = jax.random.PRNGKey(676767) # algorithm_config["TRAIN_SEED"]
     rngs = jax.random.split(rng, algorithm_config["NUM_SEEDS"])
 
 
     import time
     import os
-
-    print(config)
-
-    exit()
 
     # Toggle modes
     PROFILE_MODE = False  # Set to True for warmup + profiling, False for simple run
@@ -603,23 +599,3 @@ def save_artifacts(config, out, logger):
         logger.log_artifact(name="saved_train_run", path=out_savepath, type_name="train_run")
     if not config["local_logger"]["save_train_out"]:
         shutil.rmtree(out_savepath)
-   
-    # # Generate matplotlib plots # TODO: remove this code after creating the demo notebook
-    # metric_names = get_metric_names(config.algorithm["ENV_NAME"])
-    # all_stats = get_stats(out["metrics"], metric_names)
-    # figures, _ = plot_train_metrics(all_stats, 
-    #                                 config.algorithm["ROLLOUT_LENGTH"], 
-    #                                 config.algorithm["NUM_ENVS"],
-    #                                 savedir=savedir if config["local_logger"]["save_figures"] else None,
-    #                                 savename="ippo_train_metrics",
-    #                                 show_plots=False
-    #                                 )
-    
-    # # Log plots to wandb
-    # for stat_name, fig in figures.items():
-    #     logger.log({f"train_metrics/{stat_name}": fig})
-
-# Time limit (3600s) reached at chunk 2199
-# Training Progress:  11%|███████████████████▌                                                                                                                                                              | 2198/20000 [1:00:00<8:06:04,  1.64s/it, mean_return=20.00]
-# Total training time (s): 3600.94
-#   NUM_ENVS=128: collected 2199 data points
