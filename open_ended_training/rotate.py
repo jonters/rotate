@@ -15,6 +15,36 @@ import time
 import jax
 import jax.numpy as jnp
 
+# ---------------------------------------------------------------------------
+# Timing utilities using jax.debug.callback
+# ---------------------------------------------------------------------------
+_timing_state = {}
+
+
+def _make_timer_start(phase_name):
+    """Return a callback that records the start time for a phase."""
+    def fn(iter_idx):
+        _timing_state[(phase_name, int(iter_idx))] = time.time()
+    return fn
+
+
+def _make_timer_end(phase_name, num_updates, num_timesteps):
+    """Return a callback that logs elapsed time, updates/sec, and timesteps/sec."""
+    def fn(iter_idx, _dep):
+        key = (phase_name, int(iter_idx))
+        start = _timing_state.pop(key, None)
+        if start is None:
+            return
+        elapsed = time.time() - start
+        ups = num_updates / elapsed if elapsed > 0 else float('inf')
+        tps = num_timesteps / elapsed if elapsed > 0 else float('inf')
+        log.info(
+            f"[OEL iter {int(iter_idx)}] {phase_name}: "
+            f"{num_updates} updates in {elapsed:.2f}s ({ups:.1f} updates/sec) | "
+            f"{num_timesteps} timesteps ({tps:.1f} timesteps/sec)"
+        )
+    return fn
+
 from agents.agent_interface import ActorWithDoubleCriticPolicy, MLPActorCriticPolicy, S5ActorCriticPolicy, S5ActorWithDoubleCriticPolicy
 from agents.population_buffer import BufferedPopulation, add_partners_to_buffer, get_final_buffer
 from agents.initialize_agents import initialize_s5_agent, initialize_actor_with_double_critic
@@ -61,6 +91,18 @@ def persistent_open_ended_training_step(carry, ego_policy, conf_policy, br_polic
     prev_ego_params, prev_conf_params, prev_br_params, population_buffer, rng, oel_iter_idx = carry
     rng, partner_rng, ego_rng, conf_init_rng, br_init_rng = jax.random.split(rng, 5)
 
+    # -- Timing: full OEL iteration --
+    total_num_updates = (
+        int(config["TIMESTEPS_PER_ITER_PARTNER"]) // (
+            int(config["ROLLOUT_LENGTH"]) * 4 * int(config["NUM_ENVS"]) * int(config["PARTNER_POP_SIZE"])
+        )
+        + int(ego_config["TOTAL_TIMESTEPS"]) // (
+            int(ego_config["ROLLOUT_LENGTH"]) * int(ego_config["NUM_ENVS"])
+        )
+    )
+    total_num_timesteps = int(config["TIMESTEPS_PER_ITER_PARTNER"]) + int(ego_config["TOTAL_TIMESTEPS"])
+    jax.debug.callback(_make_timer_start("oel_iteration"), oel_iter_idx, ordered=True)
+
     # Initialize or reuse confederate parameters based on config
     if config["REINIT_CONF"]:
         init_rngs = jax.random.split(conf_init_rng, config["PARTNER_POP_SIZE"])
@@ -85,11 +127,24 @@ def persistent_open_ended_training_step(carry, ego_policy, conf_policy, br_polic
     else:
         raise ValueError(f"Invalid PARTNER_ALGO value: {config['PARTNER_ALGO']}")
 
+    # -- Timing: partner training --
+    partner_num_updates = int(config["TIMESTEPS_PER_ITER_PARTNER"]) // (
+        int(config["ROLLOUT_LENGTH"]) * 4 * int(config["NUM_ENVS"]) * int(config["PARTNER_POP_SIZE"])
+    )
+    partner_num_timesteps = int(config["TIMESTEPS_PER_ITER_PARTNER"])
+    jax.debug.callback(_make_timer_start("partner_training"), oel_iter_idx, ordered=True)
+
     train_out = train_partners_fn(config, env,
                                   ego_params=prev_ego_params, ego_policy=ego_policy,
-                                  conf_params=conf_params, conf_policy=conf_policy, 
-                                  br_params=br_params, br_policy=br_policy, 
+                                  conf_params=conf_params, conf_policy=conf_policy,
+                                  br_params=br_params, br_policy=br_policy,
                                   partner_rng=partner_rng)
+
+    # End partner timer (pass a leaf of train_out to enforce data dependency)
+    jax.debug.callback(
+        _make_timer_end("partner_training", partner_num_updates, partner_num_timesteps),
+        oel_iter_idx, jax.tree.leaves(train_out)[0], ordered=True,
+    )
         
     if config["EGO_TEAMMATE"] == "final":
         all_conf_params = train_out["final_params_conf"]
@@ -109,6 +164,13 @@ def persistent_open_ended_training_step(carry, ego_policy, conf_policy, br_polic
     # Add all checkpoints and final parameters of all partners to the buffer
     updated_buffer = add_partners_to_buffer(partner_population, population_buffer, all_conf_params)
 
+    # -- Timing: ego training --
+    ego_num_updates = int(ego_config["TOTAL_TIMESTEPS"]) // (
+        int(ego_config["ROLLOUT_LENGTH"]) * int(ego_config["NUM_ENVS"])
+    )
+    ego_num_timesteps = int(ego_config["TOTAL_TIMESTEPS"])
+    jax.debug.callback(_make_timer_start("ego_training"), oel_iter_idx, ordered=True)
+
     # Train ego agent using the population buffer
     ego_out = train_ppo_ego_agent_with_buffer(
         config=ego_config,
@@ -121,6 +183,12 @@ def persistent_open_ended_training_step(carry, ego_policy, conf_policy, br_polic
         population_buffer=updated_buffer  # Pass the buffer to the training function
     )
 
+    # End ego timer (pass a leaf of ego_out to enforce data dependency)
+    jax.debug.callback(
+        _make_timer_end("ego_training", ego_num_updates, ego_num_timesteps),
+        oel_iter_idx, jax.tree.leaves(ego_out)[0], ordered=True,
+    )
+
     updated_ego_parameters = ego_out["final_params"]
     updated_conf_parameters = train_out["final_params_conf"]
     updated_br_parameters = train_out["final_params_br"]
@@ -128,8 +196,15 @@ def persistent_open_ended_training_step(carry, ego_policy, conf_policy, br_polic
     # Remove initial dimension of 1, to ensure that input and output carry have the same dimension
     updated_ego_parameters = jax.tree_map(lambda x: x.squeeze(axis=0), updated_ego_parameters)
 
-    carry = (updated_ego_parameters, updated_conf_parameters, updated_br_parameters, 
+    carry = (updated_ego_parameters, updated_conf_parameters, updated_br_parameters,
              updated_buffer, rng, oel_iter_idx + 1)
+
+    # End full OEL iteration timer
+    jax.debug.callback(
+        _make_timer_end("oel_iteration", total_num_updates, total_num_timesteps),
+        oel_iter_idx, jax.tree.leaves(ego_out)[0], ordered=True,
+    )
+
     return carry, (train_out, ego_out)
 
 

@@ -15,3 +15,6 @@ eval_teammates/*
 
 # pretrained model weights
 obl-r2d2-flax/
+
+# belief model checkpoints
+*.msgpack

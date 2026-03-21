@@ -6,6 +6,7 @@ import jumanji
 from jumanji.environments.routing.lbf.generator import RandomGenerator as LbfGenerator
 
 from envs.lbf.adhoc_lbf_viewer import AdHocLBFViewer
+from envs.lbf.belief_wrapper import BeliefObsWrapper, load_belief_params
 from envs.jumanji_jaxmarl_wrapper import JumanjiToJaxMARL
 from envs.overcooked_v1.overcooked_wrapper import OvercookedWrapper
 from envs.overcooked_v1.augmented_layouts import augmented_layouts
@@ -55,6 +56,22 @@ def make_env(env_name: str, env_kwargs: dict = {}):
                             viewer=AdHocLBFViewer(grid_size=generator_args["grid_size"],
                                                   **viewer_args))
         env = JumanjiToJaxMARL(env, share_rewards=True)
+    elif env_name == "lbf-fov-3-markov":
+        default_generator_args = {"grid_size": 7, "fov": 3,
+                          "num_agents": 2, "num_food": 3,
+                          "max_agent_level": 2, "force_coop": True}
+        default_viewer_args = {"highlight_agent_idx": 0}
+
+        generator_args, env_kwargs_copy = process_default_args(env_kwargs, default_generator_args)
+        viewer_args, env_kwargs_copy = process_default_args(env_kwargs_copy, default_viewer_args)
+        env = jumanji.make('LevelBasedForaging-v0',
+                            generator=LbfGenerator(**generator_args),
+                            **env_kwargs_copy,
+                            viewer=AdHocLBFViewer(grid_size=generator_args["grid_size"],
+                                                  **viewer_args))
+        env = JumanjiToJaxMARL(env, share_rewards=True)
+        belief_params = load_belief_params(env_kwargs.get("belief_checkpoint", None))
+        env = BeliefObsWrapper(env, belief_params)
     elif env_name == 'overcooked-v1':
         default_env_kwargs = {"random_reset": True, "random_obj_state": False, "max_steps": 400}
         env_kwargs_copy = dict(copy.deepcopy(env_kwargs))
@@ -85,8 +102,13 @@ def make_env(env_name: str, env_kwargs: dict = {}):
         _spec.loader.exec_module(_hanabi_wrapper_module)
         HanabiWrapper = _hanabi_wrapper_module.HanabiWrapper
 
-        env_kwargs = default_env_kwargs
-        env = HanabiWrapper(**env_kwargs)
+        env_kwargs_copy = dict(copy.deepcopy(env_kwargs))
+        for key in default_env_kwargs:
+            if key not in env_kwargs_copy:
+                env_kwargs_copy[key] = default_env_kwargs[key]
+        if "num_cards_of_rank" in env_kwargs_copy and not isinstance(env_kwargs_copy["num_cards_of_rank"], np.ndarray):
+            env_kwargs_copy["num_cards_of_rank"] = np.array(env_kwargs_copy["num_cards_of_rank"])
+        env = HanabiWrapper(**env_kwargs_copy)
     elif env_name == "simple_sabotage":
         default_env_kwargs = {"max_steps": 5, "max_history_len": 5}
         env_kwargs_copy = dict(copy.deepcopy(env_kwargs))
