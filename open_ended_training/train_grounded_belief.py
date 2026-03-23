@@ -1,9 +1,8 @@
 """
-Train a grounded belief model for LBF (Level-Based Foraging).
+Train a grounded belief model for LBF or Hanabi.
 
-The belief model predicts the full unmasked observation (hidden state)
-from a trajectory of partially-masked observations, using an
-auto-regressive encoder-decoder architecture.
+The belief model predicts hidden state from a trajectory of partial
+observations, using an auto-regressive encoder-decoder architecture.
 
 Training loop: collect rollouts -> train for Y epochs -> report -> repeat.
 
@@ -26,32 +25,22 @@ from functools import partial
 from tqdm import tqdm
 
 from envs import make_env
-from envs.lbf import get_unmasked_obs
 from open_ended_training.belief_model import BeliefModel
 
 
+# ─── Game selection ──────────────────────────────────────────────────────────
+
+GAME = "hanabi"  # "lbf" or "hanabi"
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-ENV_NAME = "lbf-fov-3"
 NUM_AGENTS = 2
-NUM_FOOD = 3
-FOV = 3
-GRID_SIZE = 7
-MAX_AGENT_LEVEL = 2
-OBS_DIM = 15            # 5 objects * 3 values
-NUM_COMPONENTS = 15
-ROLLOUT_LENGTH = 128     # steps per episode
-
-# Value range for categorical bins:
-# positions in local coords can be roughly -7 to +13, levels 0-4
-# Use offset=8 so value -8 maps to index 0, value +17 maps to index 25
-VALUE_OFFSET = 8
-VOCAB_SIZE = 26
+ROLLOUT_LENGTH = 128
 
 # Training
 NUM_ITERATIONS = 100
-NUM_ROLLOUTS = 1000      # trajectories per iteration
-NUM_EPOCHS = 10          # epochs per iteration
+NUM_ROLLOUTS = 1000
+NUM_EPOCHS = 10
 BATCH_SIZE = 64
 LR = 3e-4
 GRAD_CLIP = 1.0
@@ -60,22 +49,37 @@ DECODER_HIDDEN = 256
 EMBED_DIM = 64
 SEED = 67
 
+if GAME == "lbf":
+    from envs.lbf import get_unmasked_obs as lbf_get_unmasked_obs
+
+    ENV_NAME = "lbf-fov-3"
+    NUM_FOOD = 3
+    FOV = 3
+    GRID_SIZE = 7
+    MAX_AGENT_LEVEL = 2
+    OBS_DIM = 15            # 5 objects * 3 values
+    NUM_COMPONENTS = 15
+    VALUE_OFFSET = 8
+    VOCAB_SIZE = 26
+
+elif GAME == "hanabi":
+    from envs.hanabi import get_unmasked_obs as hanabi_get_unmasked_obs
+    from envs.hanabi import hand_to_card_indices
+
+    ENV_NAME = "hanabi"
+    HAND_SIZE = 5
+    NUM_COLORS = 5
+    NUM_RANKS = 5
+    OBS_DIM = 658
+    NUM_COMPONENTS = 5      # one card index per hand slot
+    VOCAB_SIZE = 26          # 25 card types + 1 empty slot
+    VALUE_OFFSET = 0
+
+
 # ─── Rollout collection ──────────────────────────────────────────────────────
 
-def collect_rollouts(env, rng, num_rollouts, rollout_length):
-    """Collect trajectories with random actions. Returns obs and targets.
-
-    Args:
-        env: JumanjiToJaxMARL LBF environment
-        rng: PRNGKey
-        num_rollouts: number of episodes to collect
-        rollout_length: max steps per episode
-
-    Returns:
-        all_obs: (num_rollouts * 2, rollout_length, obs_dim) — both agents' masked obs
-        all_targets: (num_rollouts * 2, rollout_length, num_components) — unmasked obs
-        all_dones: (num_rollouts * 2, rollout_length) — done flags
-    """
+def collect_rollouts_lbf(env, rng, num_rollouts, rollout_length):
+    """Collect LBF trajectories with random actions."""
     num_actions = env.action_space("agent_0").n
 
     def _single_rollout(rng):
@@ -86,7 +90,6 @@ def collect_rollouts(env, rng, num_rollouts, rollout_length):
             obs, state, rng = carry
             rng, act_rng, step_rng = jax.random.split(rng, 3)
 
-            # Random actions for both agents
             actions = {
                 f"agent_{i}": jax.random.randint(
                     jax.random.fold_in(act_rng, i), (), 0, num_actions
@@ -94,17 +97,15 @@ def collect_rollouts(env, rng, num_rollouts, rollout_length):
                 for i in range(NUM_AGENTS)
             }
 
-            # Record current obs and target for BOTH agents BEFORE stepping
             obs_0 = obs["agent_0"]
             obs_1 = obs["agent_1"]
-            target_0 = get_unmasked_obs(
+            target_0 = lbf_get_unmasked_obs(
                 obs_0, state, 0, NUM_FOOD, NUM_AGENTS, FOV, GRID_SIZE
             )
-            target_1 = get_unmasked_obs(
+            target_1 = lbf_get_unmasked_obs(
                 obs_1, state, 1, NUM_FOOD, NUM_AGENTS, FOV, GRID_SIZE
             )
 
-            # Step
             next_obs, next_state, reward, done, info = env.step(
                 step_rng, state, actions
             )
@@ -114,21 +115,81 @@ def collect_rollouts(env, rng, num_rollouts, rollout_length):
         _, (obs0_traj, obs1_traj, tgt0_traj, tgt1_traj, done_traj) = jax.lax.scan(
             _step, (obs, state, rng), None, length=rollout_length
         )
-        # Stack both agents: (2, rollout_length, dim)
         obs_traj = jnp.stack([obs0_traj, obs1_traj], axis=0)
         tgt_traj = jnp.stack([tgt0_traj, tgt1_traj], axis=0)
         done_traj = jnp.stack([done_traj, done_traj], axis=0)
         return obs_traj, tgt_traj, done_traj
 
-    # Vectorize over rollouts
     rngs = jax.random.split(rng, num_rollouts)
     all_obs, all_targets, all_dones = jax.vmap(_single_rollout)(rngs)
-    # Shape: (num_rollouts, 2, rollout_length, dim) -> flatten first two dims
     all_obs = all_obs.reshape(-1, rollout_length, OBS_DIM)
     all_targets = all_targets.reshape(-1, rollout_length, NUM_COMPONENTS)
     all_dones = all_dones.reshape(-1, rollout_length)
 
     return all_obs, all_targets, all_dones
+
+
+def collect_rollouts_hanabi(env, rng, num_rollouts, rollout_length):
+    """Collect Hanabi trajectories with random legal actions."""
+
+    def _sample_legal_action(rng, legal_mask):
+        logits = jnp.where(legal_mask, 0.0, -1e10)
+        return jax.random.categorical(rng, logits)
+
+    def _single_rollout(rng):
+        rng, reset_rng = jax.random.split(rng)
+        obs, state = env.reset(reset_rng)
+
+        def _step(carry, _):
+            obs, state, rng = carry
+            rng, act_rng, step_rng = jax.random.split(rng, 3)
+
+            # Sample legal actions
+            avail = env.get_avail_actions(state)
+            actions = {
+                f"agent_{i}": _sample_legal_action(
+                    jax.random.fold_in(act_rng, i), avail[f"agent_{i}"]
+                )
+                for i in range(NUM_AGENTS)
+            }
+
+            obs_0 = obs["agent_0"]
+            obs_1 = obs["agent_1"]
+
+            # Extract hidden hand as card indices
+            hand_0 = hanabi_get_unmasked_obs(state, 0, HAND_SIZE, NUM_COLORS, NUM_RANKS)
+            hand_1 = hanabi_get_unmasked_obs(state, 1, HAND_SIZE, NUM_COLORS, NUM_RANKS)
+            target_0 = hand_to_card_indices(hand_0, HAND_SIZE, NUM_COLORS, NUM_RANKS)
+            target_1 = hand_to_card_indices(hand_1, HAND_SIZE, NUM_COLORS, NUM_RANKS)
+
+            # HanabiWrapper.step returns 6 values (extra reset_idx)
+            next_obs, next_state, reward, done, info, _ = env.step(
+                step_rng, state, actions
+            )
+
+            return (next_obs, next_state, rng), (obs_0, obs_1, target_0, target_1, done["__all__"])
+
+        _, (obs0_traj, obs1_traj, tgt0_traj, tgt1_traj, done_traj) = jax.lax.scan(
+            _step, (obs, state, rng), None, length=rollout_length
+        )
+        obs_traj = jnp.stack([obs0_traj, obs1_traj], axis=0)
+        tgt_traj = jnp.stack([tgt0_traj, tgt1_traj], axis=0)
+        done_traj = jnp.stack([done_traj, done_traj], axis=0)
+        return obs_traj, tgt_traj, done_traj
+
+    rngs = jax.random.split(rng, num_rollouts)
+    all_obs, all_targets, all_dones = jax.vmap(_single_rollout)(rngs)
+    all_obs = all_obs.reshape(-1, rollout_length, OBS_DIM)
+    all_targets = all_targets.reshape(-1, rollout_length, NUM_COMPONENTS)
+    all_dones = all_dones.reshape(-1, rollout_length)
+
+    return all_obs, all_targets, all_dones
+
+
+if GAME == "lbf":
+    collect_rollouts = collect_rollouts_lbf
+elif GAME == "hanabi":
+    collect_rollouts = collect_rollouts_hanabi
 
 
 # ─── Training utilities ──────────────────────────────────────────────────────
@@ -158,17 +219,7 @@ def create_train_state(rng):
 
 @jax.jit
 def train_step(state, obs_batch, target_batch):
-    """Single gradient step.
-
-    Args:
-        state: TrainState
-        obs_batch: (batch, seq_len, obs_dim)
-        target_batch: (batch, seq_len, num_components)
-    Returns:
-        state: updated TrainState
-        loss: scalar
-        acc: (num_components,) per-component accuracy
-    """
+    """Single gradient step."""
     def loss_fn(params):
         loss, acc = state.apply_fn(params, obs_batch, target_batch)
         return loss, acc
@@ -179,14 +230,7 @@ def train_step(state, obs_batch, target_batch):
 
 
 def train_epoch(state, obs_data, target_data, rng):
-    """One epoch over the dataset.
-
-    Args:
-        obs_data: (N, seq_len, obs_dim)
-        target_data: (N, seq_len, num_components)
-    Returns:
-        state, mean_loss, mean_acc
-    """
+    """One epoch over the dataset."""
     n = obs_data.shape[0]
     rng, perm_rng = jax.random.split(rng)
     perm = jax.random.permutation(perm_rng, n)
@@ -217,9 +261,8 @@ def main():
 
     # Create environment
     env = make_env(ENV_NAME)
-    print(f"Environment: {ENV_NAME}")
+    print(f"Environment: {ENV_NAME} (game={GAME})")
     print(f"  obs_dim={OBS_DIM}, num_components={NUM_COMPONENTS}, vocab_size={VOCAB_SIZE}")
-    print(f"  num_agents={NUM_AGENTS}, num_food={NUM_FOOD}, fov={FOV}, grid_size={GRID_SIZE}")
 
     # Initialize model
     rng, init_rng = jax.random.split(rng)
@@ -268,7 +311,7 @@ def main():
 
     # Save model
     save_dir = os.path.dirname(__file__)
-    save_path = os.path.join(save_dir, "belief_model_checkpoint.msgpack")
+    save_path = os.path.join(save_dir, f"belief_model_checkpoint_{GAME}.msgpack")
     with open(save_path, "wb") as f:
         f.write(to_bytes(state.params))
     print(f"\nModel saved to {save_path}")

@@ -210,58 +210,61 @@ def persistent_open_ended_training_step(carry, ego_policy, conf_policy, br_polic
 
 def train_persistent(rng, env, algorithm_config, ego_config):
     rng, init_ego_rng, init_conf_rng1, init_conf_rng2, init_br_rng, train_rng = jax.random.split(rng, 6)
-    # Initialize ego agent
-    ego_policy, init_ego_params = initialize_s5_agent(ego_config, env, init_ego_rng)
-    # HACK FLAG
-    # Initialize confederate agent
-    # TODO: replace conf and br with S5ActorWithDoubleCriticPolicy 
 
-    # conf_policy = ActorWithDoubleCriticPolicy(
-    #     action_dim=env.action_space(env.agents[0]).n,
-    #     obs_dim=env.observation_space(env.agents[0]).shape[0],
-    # )
+    use_mlp = algorithm_config.get("USE_MLP", False)
+    action_dim = env.action_space(env.agents[0]).n
+    obs_dim = env.observation_space(env.agents[0]).shape[0]
+    fc_hidden_dim = ego_config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024)
 
-    conf_policy = S5ActorWithDoubleCriticPolicy(
-        action_dim=env.action_space(env.agents[0]).n,
-        obs_dim=env.observation_space(env.agents[0]).shape[0],
-        d_model=ego_config.get("S5_D_MODEL", 128),
-        ssm_size=ego_config.get("S5_SSM_SIZE", 128),
-        ssm_n_layers=ego_config.get("S5_N_LAYERS", 2),
-        blocks=ego_config.get("S5_BLOCKS", 1),
-        fc_hidden_dim=ego_config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024),
-        fc_n_layers=ego_config.get("FC_N_LAYERS", 3),
-        s5_activation=ego_config.get("S5_ACTIVATION", "full_glu"),
-        s5_do_norm=ego_config.get("S5_DO_NORM", True),
-        s5_prenorm=ego_config.get("S5_PRENORM", True),
-        s5_do_gtrxl_norm=ego_config.get("S5_DO_GTRXL_NORM", True),
-    )
+    if use_mlp:
+        # MLP policies — hidden state is ignored (returns None)
+        ego_policy = MLPActorCriticPolicy(
+            action_dim=action_dim, obs_dim=obs_dim, fc_hidden_dim=fc_hidden_dim,
+        )
+        init_ego_params = ego_policy.init_params(init_ego_rng)
+
+        conf_policy = ActorWithDoubleCriticPolicy(
+            action_dim=action_dim, obs_dim=obs_dim,
+        )
+
+        br_policy = MLPActorCriticPolicy(
+            action_dim=action_dim, obs_dim=obs_dim, fc_hidden_dim=fc_hidden_dim,
+        )
+    else:
+        # S5 policies (original behavior)
+        ego_policy, init_ego_params = initialize_s5_agent(ego_config, env, init_ego_rng)
+
+        conf_policy = S5ActorWithDoubleCriticPolicy(
+            action_dim=action_dim, obs_dim=obs_dim,
+            d_model=ego_config.get("S5_D_MODEL", 128),
+            ssm_size=ego_config.get("S5_SSM_SIZE", 128),
+            ssm_n_layers=ego_config.get("S5_N_LAYERS", 2),
+            blocks=ego_config.get("S5_BLOCKS", 1),
+            fc_hidden_dim=fc_hidden_dim,
+            fc_n_layers=ego_config.get("FC_N_LAYERS", 3),
+            s5_activation=ego_config.get("S5_ACTIVATION", "full_glu"),
+            s5_do_norm=ego_config.get("S5_DO_NORM", True),
+            s5_prenorm=ego_config.get("S5_PRENORM", True),
+            s5_do_gtrxl_norm=ego_config.get("S5_DO_GTRXL_NORM", True),
+        )
+
+        br_policy = S5ActorCriticPolicy(
+            action_dim=action_dim, obs_dim=obs_dim,
+            d_model=ego_config.get("S5_D_MODEL", 128),
+            ssm_size=ego_config.get("S5_SSM_SIZE", 128),
+            ssm_n_layers=ego_config.get("S5_N_LAYERS", 2),
+            blocks=ego_config.get("S5_BLOCKS", 1),
+            fc_hidden_dim=fc_hidden_dim,
+            fc_n_layers=ego_config.get("FC_N_LAYERS", 3),
+            s5_activation=ego_config.get("S5_ACTIVATION", "full_glu"),
+            s5_do_norm=ego_config.get("S5_DO_NORM", True),
+            s5_prenorm=ego_config.get("S5_PRENORM", True),
+            s5_do_gtrxl_norm=ego_config.get("S5_DO_GTRXL_NORM", True),
+        )
+
     init_conf_rngs = jax.random.split(init_conf_rng1, algorithm_config["PARTNER_POP_SIZE"])
     init_conf_params = jax.vmap(conf_policy.init_params)(init_conf_rngs)
-    
-    # HACK FLAG
-    # assert not (algorithm_config["REINIT_BR_TO_EGO"] and algorithm_config["REINIT_BR_TO_BR"]), "Cannot reinitialize br to both ego and br"
-    # if algorithm_config["REINIT_BR_TO_EGO"]:
-        # initialize br policy to have same architecture as ego policy
-        # a bit hacky
-    br_policy = S5ActorCriticPolicy(
-        action_dim=env.action_space(env.agents[0]).n,
-        obs_dim=env.observation_space(env.agents[0]).shape[0],
-        d_model=ego_config.get("S5_D_MODEL", 128),
-        ssm_size=ego_config.get("S5_SSM_SIZE", 128),
-        ssm_n_layers=ego_config.get("S5_N_LAYERS", 2),
-        blocks=ego_config.get("S5_BLOCKS", 1),
-        fc_hidden_dim=ego_config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024),
-        fc_n_layers=ego_config.get("FC_N_LAYERS", 3),
-        s5_activation=ego_config.get("S5_ACTIVATION", "full_glu"),
-        s5_do_norm=ego_config.get("S5_DO_NORM", True),
-        s5_prenorm=ego_config.get("S5_PRENORM", True),
-        s5_do_gtrxl_norm=ego_config.get("S5_DO_GTRXL_NORM", True),
-    )
-    # else:
-    #     br_policy = MLPActorCriticPolicy(
-    #         action_dim=env.action_space(env.agents[0]).n,
-    #         obs_dim=env.observation_space(env.agents[0]).shape[0],
-    #     )
+
     init_br_rngs = jax.random.split(init_br_rng, algorithm_config["PARTNER_POP_SIZE"])
     init_br_params = jax.vmap(br_policy.init_params)(init_br_rngs)
     
@@ -279,23 +282,25 @@ def train_persistent(rng, env, algorithm_config, ego_config):
     if algorithm_config["PRETRAIN_PPO"]:
         max_pop_size += algorithm_config["PRETRAIN_ARGS"]["NUM_AGENTS"] * algorithm_config["PRETRAIN_ARGS"]["NUM_CHECKPOINTS"]
 
-    # hack to initialize the partner population's conf policy class with the right initializer shape
-    # HACK FLAG
-    # conf_policy2, init_conf_params2 = initialize_actor_with_double_critic(algorithm_config, env, init_conf_rng2)
-    conf_policy2 =S5ActorWithDoubleCriticPolicy(
-        action_dim=env.action_space(env.agents[0]).n,
-        obs_dim=env.observation_space(env.agents[0]).shape[0],
-        d_model=ego_config.get("S5_D_MODEL", 128),
-        ssm_size=ego_config.get("S5_SSM_SIZE", 128),
-        ssm_n_layers=ego_config.get("S5_N_LAYERS", 2),
-        blocks=ego_config.get("S5_BLOCKS", 1),
-        fc_hidden_dim=ego_config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024),
-        fc_n_layers=ego_config.get("FC_N_LAYERS", 3),
-        s5_activation=ego_config.get("S5_ACTIVATION", "full_glu"),
-        s5_do_norm=ego_config.get("S5_DO_NORM", True),
-        s5_prenorm=ego_config.get("S5_PRENORM", True),
-        s5_do_gtrxl_norm=ego_config.get("S5_DO_GTRXL_NORM", True),
-    )
+    # Initialize the partner population's conf policy class with the right initializer shape
+    if use_mlp:
+        conf_policy2 = ActorWithDoubleCriticPolicy(
+            action_dim=action_dim, obs_dim=obs_dim,
+        )
+    else:
+        conf_policy2 = S5ActorWithDoubleCriticPolicy(
+            action_dim=action_dim, obs_dim=obs_dim,
+            d_model=ego_config.get("S5_D_MODEL", 128),
+            ssm_size=ego_config.get("S5_SSM_SIZE", 128),
+            ssm_n_layers=ego_config.get("S5_N_LAYERS", 2),
+            blocks=ego_config.get("S5_BLOCKS", 1),
+            fc_hidden_dim=fc_hidden_dim,
+            fc_n_layers=ego_config.get("FC_N_LAYERS", 3),
+            s5_activation=ego_config.get("S5_ACTIVATION", "full_glu"),
+            s5_do_norm=ego_config.get("S5_DO_NORM", True),
+            s5_prenorm=ego_config.get("S5_PRENORM", True),
+            s5_do_gtrxl_norm=ego_config.get("S5_DO_GTRXL_NORM", True),
+        )
     init_conf_params2 = conf_policy2.init_params(init_conf_rng2)
     
     partner_population = BufferedPopulation(
@@ -386,6 +391,17 @@ def run_rotate(config, wandb_logger):
     # Prepare return values for heldout evaluation
     _, ego_outs = outs
     ego_params = jax.tree_map(lambda x: x[:, :, 0], ego_outs["final_params"]) # shape (num_seeds, num_open_ended_iters, 1, num_ckpts, leaf_dim)
-    ego_policy, init_ego_params = initialize_s5_agent(ego_config, env, init_ego_rng)
+
+    use_mlp = algorithm_config.get("USE_MLP", False)
+    if use_mlp:
+        action_dim = env.action_space(env.agents[0]).n
+        obs_dim = env.observation_space(env.agents[0]).shape[0]
+        fc_hidden_dim = ego_config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024)
+        ego_policy = MLPActorCriticPolicy(
+            action_dim=action_dim, obs_dim=obs_dim, fc_hidden_dim=fc_hidden_dim,
+        )
+        init_ego_params = ego_policy.init_params(init_ego_rng)
+    else:
+        ego_policy, init_ego_params = initialize_s5_agent(ego_config, env, init_ego_rng)
 
     return ego_policy, ego_params, init_ego_params

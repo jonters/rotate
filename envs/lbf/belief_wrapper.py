@@ -23,7 +23,7 @@ from open_ended_training.belief_model import BeliefModel
 @dataclass
 class BeliefWrappedState:
     """Env state augmented with per-agent LSTM carries."""
-    inner_state: Any          # WrappedEnvState from the base env
+    env_state: Any          # WrappedEnvState from the base env
     belief_carries: Any       # dict-like: per-agent LSTM carries
     rng: jnp.ndarray          # RNG for belief sampling
 
@@ -75,7 +75,7 @@ class BeliefObsWrapper:
         carry = self.belief_model.init_carry(batch_size=1)
         return {agent: carry for agent in self.agents}
 
-    def _augment_obs(self, obs, inner_state, belief_carries, rng):
+    def _augment_obs(self, obs, env_state, belief_carries, rng):
         """Run belief encoder step + decode for each agent, concat with obs."""
         new_obs = {}
         new_carries = {}
@@ -101,15 +101,15 @@ class BeliefObsWrapper:
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key, params=None):
         key, belief_rng = jax.random.split(key)
-        obs, inner_state = self.env.reset(key)
+        obs, env_state = self.env.reset(key)
         belief_carries = self._init_belief_carries()
 
         obs, belief_carries, belief_rng = self._augment_obs(
-            obs, inner_state, belief_carries, belief_rng
+            obs, env_state, belief_carries, belief_rng
         )
 
         state = BeliefWrappedState(
-            inner_state=inner_state,
+            env_state=env_state,
             belief_carries=belief_carries,
             rng=belief_rng,
         )
@@ -117,8 +117,8 @@ class BeliefObsWrapper:
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, key, state: BeliefWrappedState, actions, params=None):
-        obs, inner_state, reward, done, info = self.env.step(
-            key, state.inner_state, actions
+        obs, env_state, reward, done, info = self.env.step(
+            key, state.env_state, actions
         )
 
         # On episode reset, re-initialize belief carries
@@ -130,11 +130,11 @@ class BeliefObsWrapper:
         )
 
         obs, belief_carries, belief_rng = self._augment_obs(
-            obs, inner_state, belief_carries, state.rng
+            obs, env_state, belief_carries, state.rng
         )
 
         new_state = BeliefWrappedState(
-            inner_state=inner_state,
+            env_state=env_state,
             belief_carries=belief_carries,
             rng=belief_rng,
         )
@@ -147,10 +147,10 @@ class BeliefObsWrapper:
         return self.env.action_space(agent)
 
     def get_avail_actions(self, state: BeliefWrappedState):
-        return self.env.get_avail_actions(state.inner_state)
+        return self.env.get_avail_actions(state.env_state)
 
     def render(self, state: BeliefWrappedState):
-        self.env.render(state.inner_state)
+        self.env.render(state.env_state)
 
 
 def load_belief_params(checkpoint_path=None):
