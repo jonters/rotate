@@ -18,3 +18,5 @@ obl-r2d2-flax/
 
 # belief model checkpoints
 *.msgpack
+
+wandb/

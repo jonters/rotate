@@ -214,21 +214,24 @@ def train_persistent(rng, env, algorithm_config, ego_config):
     use_mlp = algorithm_config.get("USE_MLP", False)
     action_dim = env.action_space(env.agents[0]).n
     obs_dim = env.observation_space(env.agents[0]).shape[0]
-    fc_hidden_dim = ego_config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024)
+    fc_hidden_dim = algorithm_config.get("FC_HIDDEN_DIM", ego_config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024))
+    activation = algorithm_config.get("ACTIVATION", "tanh")
 
     if use_mlp:
         # MLP policies — hidden state is ignored (returns None)
         ego_policy = MLPActorCriticPolicy(
             action_dim=action_dim, obs_dim=obs_dim, fc_hidden_dim=fc_hidden_dim,
+            activation=activation,
         )
         init_ego_params = ego_policy.init_params(init_ego_rng)
 
         conf_policy = ActorWithDoubleCriticPolicy(
-            action_dim=action_dim, obs_dim=obs_dim,
+            action_dim=action_dim, obs_dim=obs_dim, activation=activation,
         )
 
         br_policy = MLPActorCriticPolicy(
             action_dim=action_dim, obs_dim=obs_dim, fc_hidden_dim=fc_hidden_dim,
+            activation=activation,
         )
     else:
         # S5 policies (original behavior)
@@ -396,9 +399,11 @@ def run_rotate(config, wandb_logger):
     if use_mlp:
         action_dim = env.action_space(env.agents[0]).n
         obs_dim = env.observation_space(env.agents[0]).shape[0]
-        fc_hidden_dim = ego_config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024)
+        fc_hidden_dim = algorithm_config.get("FC_HIDDEN_DIM", ego_config.get("S5_ACTOR_CRITIC_HIDDEN_DIM", 1024))
+        activation = algorithm_config.get("ACTIVATION", "tanh")
         ego_policy = MLPActorCriticPolicy(
             action_dim=action_dim, obs_dim=obs_dim, fc_hidden_dim=fc_hidden_dim,
+            activation=activation,
         )
         init_ego_params = ego_policy.init_params(init_ego_rng)
     else:
